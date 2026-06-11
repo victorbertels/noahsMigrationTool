@@ -1,5 +1,11 @@
 import streamlit as st
 
+st.set_page_config(
+    page_title="Noah's Quest Migration",
+    layout="centered",
+    initial_sidebar_state="collapsed",
+)
+
 from analytics import track_event, track_page
 from api import get_location
 from migration import (
@@ -10,7 +16,7 @@ from migration import (
     run_revert,
     validate_location_account,
 )
-from ui import (
+from app_ui import (
     apply_styles,
     format_box,
     init_migrate_session_state,
@@ -185,12 +191,6 @@ def revert_page(allowed_account_id: str):
             except Exception as error:
                 st.error(str(error))
 
-
-st.set_page_config(
-    page_title="Noah's Quest Migration",
-    layout="centered",
-    initial_sidebar_state="collapsed",
-)
 
 apply_styles()
 render_header()
