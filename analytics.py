@@ -45,6 +45,10 @@ def _revert_location_name() -> Optional[str]:
     return st.session_state.get("revert_location_name")
 
 
+def _label(location_id: Optional[str], location_name: Optional[str]) -> str:
+    return location_name or location_id or ""
+
+
 def track_page(action: str, location_id: Optional[str] = None, location_name: Optional[str] = None):
     """Fire once per page visit (not on every Streamlit rerun)."""
     last_page = st.session_state.get("_tracked_page")
@@ -64,7 +68,7 @@ def track_page(action: str, location_id: Optional[str] = None, location_name: Op
 
     _send(
         {
-            "page": f"{action}_page_view_{location_name}",
+            "page": f"{action}_page_view_{_label(location_id, location_name)}",
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
     )
@@ -90,7 +94,7 @@ def track_event(
 
     _send(
         {
-            "page": f"{event_name}_{location_name}",
+            "page": f"{event_name}_{_label(location_id, location_name)}",
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
     )

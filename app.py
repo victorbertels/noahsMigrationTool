@@ -44,6 +44,7 @@ def migrate_page(allowed_account_id: str):
             reset_from_location_change()
 
         if st.button("Look up location", disabled=not location_id_input, use_container_width=True):
+            track_event("location_lookup_started", action="migrate", location_id=location_id_input)
             try:
                 location, status = get_location(location_id_input)
                 if status != 200:
@@ -56,7 +57,6 @@ def migrate_page(allowed_account_id: str):
                     st.session_state.backup_bytes = None
                     st.session_state.backup_filename = None
                     st.session_state.backup_downloaded = False
-                    track_event("location_lookup", action="migrate")
             except AccountGuardrailError as error:
                 st.error(str(error))
             except Exception as error:
