@@ -64,10 +64,7 @@ def track_page(action: str, location_id: Optional[str] = None, location_name: Op
 
     _send(
         {
-            "event": "page_view",
-            "action": action,
-            "location_id": location_id,
-            "location_name": location_name,
+            "page": f"{action}_page_view_{location_name}",
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
     )
@@ -93,11 +90,7 @@ def track_event(
 
     _send(
         {
-            "event": event_name,
-            "action": action,
-            "location_id": location_id,
-            "location_name": location_name,
+            "page": f"{event_name}_{location_name}",
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            **details,
         }
     )
