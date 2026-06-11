@@ -1,5 +1,6 @@
 import io
 import json
+import re
 import zipfile
 from datetime import datetime, timezone
 
@@ -15,6 +16,46 @@ from api import (
 
 WOLT_NAMES = ["Wolt Storefront - Q8", "Wolt"]
 WOLT_CHANNELS = [16, 6016]
+
+
+def _wolt_migration_action(name: str, original_tags: list) -> str:
+    if name == "Wolt Storefront - Q8":
+        intro = f"Found Wolt Storefront ({name}) → converting to Wolt retail channel (6016)"
+    else:
+        intro = f"Found Wolt ({name}) → converting to Wolt retail channel (6016)"
+
+    steps = [intro]
+    if "Quest" not in original_tags:
+        steps.append("adding Quest tag")
+    else:
+        steps.append("keeping Quest tag")
+    steps.extend(
+        [
+            "enabling sendToQuest",
+            "disabling DMA",
+            "enabling autoAcceptRetailOrder",
+        ]
+    )
+    return ", ".join(steps) + "."
+
+
+def _food_channel_migration_action(name: str) -> str:
+    return (
+        f"Found {name} → updating food channel to route orders to Quest "
+        "(sendToQuest on, insertPosOrderAfterDmaAccept off, DMA off)."
+    )
+
+
+def _location_migration_action(location: dict, original_tags: list) -> str:
+    location_name = location.get("name", "location")
+    changes = []
+    if "Quest Migrated" not in original_tags:
+        changes.append("adding 'Quest Migrated'")
+    if "Not migrated" in original_tags:
+        changes.append("removing 'Not migrated'")
+    if not changes:
+        changes.append("tags already up to date")
+    return f"Updating location {location_name} → {', '.join(changes)}."
 
 
 class AccountGuardrailError(Exception):
@@ -52,6 +93,12 @@ def validate_channel_link_account(channel_link: dict, allowed_account_id: str, l
         )
 
 
+def _sanitize_filename_part(value: str) -> str:
+    sanitized = re.sub(r"[^\w\-]+", "_", value.strip())
+    sanitized = re.sub(r"_+", "_", sanitized).strip("_")
+    return sanitized[:80] or "location"
+
+
 def fetch_location_snapshot(location_id: str, allowed_account_id: str) -> dict:
     location, status = get_location(location_id)
     if status != 200:
@@ -79,12 +126,15 @@ def fetch_location_snapshot(location_id: str, allowed_account_id: str) -> dict:
 
 def create_backup_zip(location_id: str, allowed_account_id: str) -> tuple[bytes, str]:
     snapshot = fetch_location_snapshot(location_id, allowed_account_id)
-    filename = f"backup_{location_id}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.zip"
+    location_name = _sanitize_filename_part(snapshot["location"].get("name", "location"))
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    filename = f"backup_{location_name}_{location_id}_{timestamp}.zip"
 
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
         manifest = {
             "location_id": location_id,
+            "location_name": snapshot["location"].get("name"),
             "account_id": allowed_account_id,
             "created_at": snapshot["created_at"],
             "channel_link_ids": [item["_id"] for item in snapshot["channel_links"]],
@@ -154,7 +204,10 @@ def run_migration(location_id: str, allowed_account_id: str) -> list[dict]:
         tags = channel_link.get("tags", []).copy()
         etag = channel_link.get("_etag")
 
+        original_tags = tags.copy()
+
         if name in WOLT_NAMES and channel in WOLT_CHANNELS:
+            action = _wolt_migration_action(name, original_tags)
             if "Quest" not in tags:
                 tags.append("Quest")
             payload = {
@@ -173,6 +226,7 @@ def run_migration(location_id: str, allowed_account_id: str) -> list[dict]:
                 },
             }
         else:
+            action = _food_channel_migration_action(name)
             payload = {
                 "channelSettings": {
                     "sendToQuest": True,
@@ -188,13 +242,15 @@ def run_migration(location_id: str, allowed_account_id: str) -> list[dict]:
                 "type": "channel_link",
                 "id": channel_link_id,
                 "name": name,
+                "action": action,
                 "status": response_status,
                 "ok": 200 <= response_status < 300,
                 "response": response_data,
             }
         )
 
-    location_tags = location.get("tags", []).copy()
+    original_location_tags = location.get("tags", []).copy()
+    location_tags = original_location_tags.copy()
     if "Quest Migrated" not in location_tags:
         location_tags.append("Quest Migrated")
     if "Not migrated" in location_tags:
@@ -210,6 +266,8 @@ def run_migration(location_id: str, allowed_account_id: str) -> list[dict]:
         {
             "type": "location",
             "id": location_id,
+            "name": location.get("name"),
+            "action": _location_migration_action(location, original_location_tags),
             "status": location_status,
             "ok": 200 <= location_status < 300,
             "response": location_response,

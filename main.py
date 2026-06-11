@@ -18,5 +18,5 @@ for result in results:
         print(result["message"])
         continue
     status = "OK" if result.get("ok") else "FAILED"
-    label = result.get("name") or result.get("id")
-    print(f"{result['type']} {label}: {status} (HTTP {result['status']})")
+    message = result.get("action") or f"{result['type']} {result.get('name') or result.get('id')}"
+    print(f"[{status}] {message} (HTTP {result['status']})")
