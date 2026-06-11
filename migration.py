@@ -72,8 +72,7 @@ def validate_location_account(location: dict, allowed_account_id: str):
     location_account = location.get("account")
     if location_account != allowed_account_id:
         raise AccountGuardrailError(
-            f"Location {location.get('_id')} belongs to account {location_account}, "
-            f"but only account {allowed_account_id} is allowed."
+            f"Location {location.get('_id')}does not belong to {allowed_account_id}."
         )
 
 
