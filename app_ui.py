@@ -1,3 +1,4 @@
+import hmac
 import os
 
 import streamlit as st
@@ -184,6 +185,37 @@ def get_config_value(key: str) -> str:
         return st.secrets[key]
     except Exception:
         return value
+
+
+def render_password_gate():
+    if st.session_state.get("authenticated"):
+        return
+
+    expected_password = get_config_value("APP_PASSWORD")
+    if not expected_password:
+        st.error("App is not configured. Set APP_PASSWORD in secrets or environment.")
+        st.stop()
+
+    st.markdown(
+        """
+        <div class="app-header">
+            <h1>Noah's Quest Migration</h1>
+            <p>Enter the password to access this tool.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    with st.container(border=True):
+        password = st.text_input("Password", type="password", key="gate_password")
+        if st.button("Continue", type="primary", use_container_width=True):
+            if hmac.compare_digest(password, expected_password):
+                st.session_state.authenticated = True
+                st.rerun()
+            else:
+                st.error("Incorrect password.")
+
+    st.stop()
 
 
 def load_credentials():

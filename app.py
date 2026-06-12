@@ -24,6 +24,7 @@ from app_ui import (
     location_card,
     render_header,
     render_nav,
+    render_password_gate,
     reset_from_location_change,
     show_results,
     step_heading,
@@ -193,6 +194,7 @@ def revert_page(allowed_account_id: str):
 
 
 apply_styles()
+render_password_gate()
 render_header()
 allowed_account_id = load_credentials()
 active_page = render_nav()
