@@ -1,4 +1,6 @@
-from typing import Dict, Optional, Tuple
+import json
+from typing import Dict, List, Optional, Tuple
+from urllib.parse import urlencode
 
 import requests
 
@@ -15,6 +17,7 @@ PUT_RESTRICTED_KEYS = {
     "_deleted",
     "isCanary",
     "lastProductSync",
+    "channelLinksDetails",
 }
 
 
@@ -23,7 +26,13 @@ def prepare_put_payload(data: Dict) -> Dict:
     return {key: value for key, value in data.items() if key not in PUT_RESTRICTED_KEYS}
 
 
-def _request(method: str, path: str, payload: Optional[Dict] = None, etag: Optional[str] = None):
+def _request(
+    method: str,
+    path: str,
+    payload: Optional[Dict] = None,
+    etag: Optional[str] = None,
+    params: Optional[Dict] = None,
+):
     headers = getHeaders()
     headers["Content-Type"] = "application/json"
     if etag:
@@ -31,9 +40,13 @@ def _request(method: str, path: str, payload: Optional[Dict] = None, etag: Optio
     else:
         headers.pop("If-Match", None)
 
+    url = f"{BASE_URL}/{path}"
+    if params:
+        url = f"{url}?{urlencode(params)}"
+
     response = requests.request(
         method,
-        f"{BASE_URL}/{path}",
+        url,
         headers=headers,
         json=payload if payload is not None else None,
     )
@@ -43,6 +56,43 @@ def _request(method: str, path: str, payload: Optional[Dict] = None, etag: Optio
 def get_location(location_id: str) -> Tuple[Dict, int]:
     response = _request("GET", f"locations/{location_id}")
     return response.json(), response.status_code
+
+
+def list_all_locations(account_id: str) -> List[Dict]:
+    """Fetch all locations for an account using cursor pagination."""
+    locations: List[Dict] = []
+    page = 1
+    cursor = "new"
+
+    while True:
+        params = {
+            "where": json.dumps({"account": account_id}),
+            "max_results": 500,
+            "cursor": cursor,
+            "page": page,
+        }
+        response = _request("GET", "locations", params=params)
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"Failed to list locations for account {account_id}: HTTP {response.status_code}"
+            )
+
+        data = response.json()
+        items = data.get("_items", data if isinstance(data, list) else [])
+        locations.extend(items)
+
+        meta = data.get("_meta", {}) if isinstance(data, dict) else {}
+        total = meta.get("total")
+        if total is not None and len(locations) >= total:
+            break
+        if len(items) < 500:
+            break
+
+        if page == 1 and meta.get("cursor"):
+            cursor = meta["cursor"]
+        page += 1
+
+    return locations
 
 
 def patch_location(location_id: str, payload: Dict, etag: str) -> Tuple[Dict, int]:

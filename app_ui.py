@@ -65,6 +65,54 @@ def apply_styles():
                 margin: 0.25rem 0 0 0;
                 font-family: monospace;
             }
+            .match-summary {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 0.6rem;
+                margin: 0.75rem 0 1rem 0;
+            }
+            .match-chip {
+                display: inline-flex;
+                align-items: center;
+                gap: 0.35rem;
+                padding: 0.45rem 0.75rem;
+                border-radius: 999px;
+                font-size: 0.88rem;
+                font-weight: 600;
+                border: 1px solid transparent;
+            }
+            .match-chip.ready {
+                background: #ecfdf5;
+                color: #047857;
+                border-color: #a7f3d0;
+            }
+            .match-chip.muted {
+                background: #f3f4f6;
+                color: #6b7280;
+                border-color: #e5e7eb;
+            }
+            .match-chip.warn {
+                background: #fff7ed;
+                color: #c2410c;
+                border-color: #fed7aa;
+            }
+            .match-all-good {
+                background: #ecfdf5;
+                border: 1px solid #a7f3d0;
+                border-radius: 12px;
+                padding: 0.85rem 1rem;
+                margin: 0.5rem 0 1rem 0;
+                color: #065f46;
+            }
+            .match-all-good strong {
+                display: block;
+                font-size: 1rem;
+                margin-bottom: 0.15rem;
+            }
+            .match-all-good span {
+                font-size: 0.9rem;
+                color: #047857;
+            }
             .format-box {
                 background: #f9fafb;
                 border: 1px solid #e5e7eb;
@@ -110,35 +158,44 @@ def render_header():
     st.markdown(
         """
         <div class="app-header">
-            <h1>Noah's Quest Migration</h1>
-            <p>Deliverect → Quest migration with backup &amp; restore</p>
+            <h1>Noah's Migration Tools</h1>
+            <p>Quest settings migration and account channel-link moves, with backup &amp; restore</p>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
 
+PAGE_LABELS = {
+    "migrate": "Quest migrate",
+    "revert": "Quest revert",
+    "account_move": "Account move",
+    "account_revert": "Account revert",
+}
+
+
 def render_nav() -> str:
     if "active_page" not in st.session_state:
         st.session_state.active_page = "migrate"
 
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button(
-            "Migrate",
-            type="primary" if st.session_state.active_page == "migrate" else "secondary",
-            use_container_width=True,
-        ):
-            st.session_state.active_page = "migrate"
-            st.rerun()
-    with col2:
-        if st.button(
-            "Revert",
-            type="primary" if st.session_state.active_page == "revert" else "secondary",
-            use_container_width=True,
-        ):
-            st.session_state.active_page = "revert"
-            st.rerun()
+    # Migrate older session values from the 2-button nav
+    if st.session_state.active_page not in PAGE_LABELS:
+        st.session_state.active_page = "migrate"
+
+    row1 = st.columns(2)
+    row2 = st.columns(2)
+    page_order = ["migrate", "revert", "account_move", "account_revert"]
+    for index, page_key in enumerate(page_order):
+        column = row1[index] if index < 2 else row2[index - 2]
+        with column:
+            if st.button(
+                PAGE_LABELS[page_key],
+                type="primary" if st.session_state.active_page == page_key else "secondary",
+                use_container_width=True,
+                key=f"nav_{page_key}",
+            ):
+                st.session_state.active_page = page_key
+                st.rerun()
 
     st.markdown("<div style='margin-bottom: 1.2rem'></div>", unsafe_allow_html=True)
     return st.session_state.active_page
@@ -162,17 +219,86 @@ def location_card(name: str, location_id: str):
     )
 
 
+def account_move_match_summary(ready_count: int, already_moved_count: int, unmatched_count: int):
+    total = ready_count + already_moved_count + unmatched_count
+    all_matched = unmatched_count == 0 and total > 0
+
+    if all_matched:
+        if already_moved_count == 0:
+            detail = f"All {ready_count} location(s) matched and ready to move."
+        elif ready_count == 0:
+            detail = f"All {already_moved_count} location(s) are already moved or skipped."
+        else:
+            detail = (
+                f"{ready_count} ready to move · {already_moved_count} already moved/skipped. "
+                "Nothing unmatched."
+            )
+        st.markdown(
+            f"""
+            <div class="match-all-good">
+                <strong>All locations matched</strong>
+                <span>{detail}</span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        chips = [f'<span class="match-chip ready">Ready · {ready_count}</span>']
+        if already_moved_count:
+            chips.append(
+                f'<span class="match-chip muted">Already moved · {already_moved_count}</span>'
+            )
+        st.markdown(
+            f'<div class="match-summary">{"".join(chips)}</div>',
+            unsafe_allow_html=True,
+        )
+        return
+
+    chips = [f'<span class="match-chip ready">Ready · {ready_count}</span>']
+    if already_moved_count:
+        chips.append(
+            f'<span class="match-chip muted">Already moved · {already_moved_count}</span>'
+        )
+    chips.append(
+        f'<span class="match-chip warn">Unmatched · {unmatched_count}</span>'
+    )
+    st.markdown(
+        f'<div class="match-summary">{"".join(chips)}</div>',
+        unsafe_allow_html=True,
+    )
+    st.warning(
+        f"{unmatched_count} location(s) could not be matched by name and will be skipped."
+    )
+
+
 def format_box():
     st.markdown(
         """
         <div class="format-box">
-            <strong>Expected format:</strong> a <code>.zip</code> backup created by this app.<br><br>
+            <strong>Expected format:</strong> a <code>.zip</code> backup created by Quest migrate.<br><br>
             <pre>manifest.json
 location.json
 channelLinks/
   {channelLinkId}.json
   ...</pre>
             Restores the full location and all channel links from the snapshot.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def account_move_format_box():
+    st.markdown(
+        """
+        <div class="format-box">
+            <strong>Expected format:</strong> a <code>.zip</code> backup created by Account move.<br><br>
+            <pre>manifest.json
+moves/{originalLocationId}/
+  original_location.json
+  destination_location.json
+  channelLinks/{channelLinkId}.json
+  ...</pre>
+            Moves channel links back to the original account/location and restores both location snapshots.
         </div>
         """,
         unsafe_allow_html=True,
@@ -199,7 +325,7 @@ def render_password_gate():
     st.markdown(
         """
         <div class="app-header">
-            <h1>Noah's Quest Migration</h1>
+            <h1>Noah's Migration Tools</h1>
             <p>Enter the password to access this tool.</p>
         </div>
         """,
@@ -224,7 +350,10 @@ def load_credentials():
     allowed_account_id = get_config_value("ALLOWED_ACCOUNT_ID")
 
     if not client_id or not client_secret or not allowed_account_id:
-        st.error("App is not configured. Set CLIENT_ID, CLIENT_SECRET, and ALLOWED_ACCOUNT_ID in secrets.")
+        st.error(
+            "App is not configured. Set CLIENT_ID, CLIENT_SECRET, and "
+            "ALLOWED_ACCOUNT_ID in secrets or environment."
+        )
         st.stop()
 
     set_credentials(client_id, client_secret)
@@ -237,20 +366,61 @@ def show_results(results: list[dict]):
 
     with st.container(border=True):
         st.markdown("**Results**")
+
+        rows = []
+        failures = []
         for result in results:
             if result.get("type") == "warning":
-                st.warning(result["message"])
+                rows.append(
+                    {
+                        "Status": "🟡",
+                        "Type": "warning",
+                        "Name": "",
+                        "Detail": result.get("message", ""),
+                        "HTTP": "",
+                    }
+                )
                 continue
 
-            message = result.get("action") or f"{result['type']} {result.get('name') or result.get('id')}"
-            if result.get("ok"):
-                st.success(message)
-                st.caption(f"HTTP {result['status']}")
-            else:
-                st.error(message)
-                st.caption(f"HTTP {result['status']}")
-                if result.get("response"):
-                    st.json(result["response"])
+            ok = result.get("ok")
+            rows.append(
+                {
+                    "Status": "🟢" if ok else "🔴",
+                    "Type": result.get("type") or "",
+                    "Name": result.get("name") or result.get("id") or "",
+                    "Detail": result.get("action")
+                    or f"{result.get('type')} {result.get('name') or result.get('id')}",
+                    "HTTP": result.get("status", ""),
+                }
+            )
+            if not ok:
+                failures.append(result)
+
+        ok_count = sum(1 for row in rows if row["Status"] == "🟢")
+        fail_count = sum(1 for row in rows if row["Status"] == "🔴")
+        warn_count = sum(1 for row in rows if row["Status"] == "🟡")
+
+        if fail_count == 0 and warn_count == 0 and ok_count:
+            st.markdown(
+                f'<div class="match-all-good"><strong>All {ok_count} step(s) succeeded</strong></div>',
+                unsafe_allow_html=True,
+            )
+        elif fail_count == 0 and ok_count:
+            st.success(f"{ok_count} succeeded · {warn_count} skipped/info")
+        elif fail_count:
+            st.error(f"{fail_count} failed · {ok_count} succeeded · {warn_count} skipped/info")
+
+        st.dataframe(rows, use_container_width=True, hide_index=True)
+
+        for failure in failures:
+            with st.expander(
+                f"Error details · {failure.get('name') or failure.get('id')}",
+                expanded=False,
+            ):
+                if failure.get("response"):
+                    st.json(failure["response"])
+                else:
+                    st.write(failure)
 
 
 def init_migrate_session_state():
@@ -275,3 +445,74 @@ def reset_from_location_change():
     st.session_state.backup_bytes = None
     st.session_state.backup_filename = None
     st.session_state.backup_downloaded = False
+
+
+def init_account_move_session_state():
+    defaults = {
+        "am_mode": "per_location",
+        "am_old_account_id": "",
+        "am_new_account_id": "",
+        "am_accounts_confirmed": False,
+        "am_location_id_input": "",
+        "am_location_id": None,
+        "am_location_name": None,
+        "am_match_name": None,
+        "am_channel_link_count": 0,
+        "am_retained_count": 0,
+        "am_destination_id": None,
+        "am_destination_name": None,
+        "am_status": None,
+        "am_snapshot": None,
+        "am_confirmed": False,
+        "am_backup_bytes": None,
+        "am_backup_filename": None,
+        "am_backup_downloaded": False,
+        "am_rest_rows": None,
+        "am_rest_loaded": False,
+        "am_rest_snapshots": None,
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+def init_account_revert_session_state():
+    defaults = {
+        "ar_old_account_id": "",
+        "ar_new_account_id": "",
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+def reset_account_move_per_location():
+    st.session_state.am_location_id = None
+    st.session_state.am_location_name = None
+    st.session_state.am_match_name = None
+    st.session_state.am_channel_link_count = 0
+    st.session_state.am_retained_count = 0
+    st.session_state.am_destination_id = None
+    st.session_state.am_destination_name = None
+    st.session_state.am_status = None
+    st.session_state.am_snapshot = None
+    st.session_state.am_confirmed = False
+    st.session_state.am_backup_bytes = None
+    st.session_state.am_backup_filename = None
+    st.session_state.am_backup_downloaded = False
+
+
+def reset_account_move_rest():
+    st.session_state.am_rest_rows = None
+    st.session_state.am_rest_loaded = False
+    st.session_state.am_rest_snapshots = None
+    st.session_state.am_backup_bytes = None
+    st.session_state.am_backup_filename = None
+    st.session_state.am_backup_downloaded = False
+
+
+def reset_account_move_from_accounts_change():
+    st.session_state.am_accounts_confirmed = False
+    st.session_state.am_location_id_input = ""
+    reset_account_move_per_location()
+    reset_account_move_rest()

@@ -37,6 +37,17 @@ def _migrate_location_name() -> Optional[str]:
     return st.session_state.get("location_name")
 
 
+def _account_move_location_id() -> Optional[str]:
+    location_id = st.session_state.get("am_location_id")
+    if location_id:
+        return location_id
+    return st.session_state.get("am_location_id_input") or None
+
+
+def _account_move_location_name() -> Optional[str]:
+    return st.session_state.get("am_location_name")
+
+
 def _revert_location_id() -> Optional[str]:
     return st.session_state.get("revert_location_id")
 
@@ -49,6 +60,23 @@ def _label(location_id: Optional[str], location_name: Optional[str]) -> str:
     return location_name or location_id or ""
 
 
+def _resolve_location_context(
+    action: Optional[str],
+    location_id: Optional[str],
+    location_name: Optional[str],
+) -> tuple[Optional[str], Optional[str]]:
+    if location_id is not None:
+        return location_id, location_name
+
+    if action == "migrate":
+        return _migrate_location_id(), location_name or _migrate_location_name()
+    if action in ("account_move",):
+        return _account_move_location_id(), location_name or _account_move_location_name()
+    if action in ("revert", "account_revert"):
+        return _revert_location_id(), location_name or _revert_location_name()
+    return None, location_name
+
+
 def track_page(action: str, location_id: Optional[str] = None, location_name: Optional[str] = None):
     """Fire once per page visit (not on every Streamlit rerun)."""
     last_page = st.session_state.get("_tracked_page")
@@ -58,13 +86,7 @@ def track_page(action: str, location_id: Optional[str] = None, location_name: Op
     st.session_state["_tracked_page"] = action
     st.session_state["_tracked_action"] = action
 
-    if location_id is None:
-        if action == "migrate":
-            location_id = _migrate_location_id()
-            location_name = location_name or _migrate_location_name()
-        elif action == "revert":
-            location_id = _revert_location_id()
-            location_name = location_name or _revert_location_name()
+    location_id, location_name = _resolve_location_context(action, location_id, location_name)
 
     _send(
         {
@@ -83,18 +105,18 @@ def track_event(
 ):
     """Fire when a user completes a meaningful action."""
     action = action or st.session_state.get("_tracked_action")
+    location_id, location_name = _resolve_location_context(action, location_id, location_name)
 
-    if location_id is None:
-        if action == "migrate":
-            location_id = _migrate_location_id()
-            location_name = location_name or _migrate_location_name()
-        elif action == "revert":
-            location_id = _revert_location_id()
-            location_name = location_name or _revert_location_name()
+    mode = details.get("mode") or st.session_state.get("am_mode")
+    label = _label(location_id, location_name)
+    if mode and action in ("account_move", "account_revert"):
+        page = f"{event_name}_{mode}_{label}" if label else f"{event_name}_{mode}"
+    else:
+        page = f"{event_name}_{label}"
 
     _send(
         {
-            "page": f"{event_name}_{_label(location_id, location_name)}",
+            "page": page,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
     )
