@@ -8,14 +8,17 @@ from typing import Optional
 from api import (
     get_channel_link,
     get_location,
+    get_user,
     list_all_locations,
+    list_all_users,
     patch_channel_link,
     patch_location,
+    patch_user,
     prepare_put_payload,
     put_channel_link,
 )
 
-MIGRATED_MARKER_RE = re.compile(r"#MIGRATED[0-9a-fA-F]+#")
+MIGRATED_MARKER_RE = re.compile(r"#MIGRATED(?:TO)?[0-9a-fA-F]+#")
 
 # Stays on the original location; destination already has its own copy.
 RETAINED_TEST_CHANNEL = 1
@@ -47,6 +50,28 @@ def partition_channel_links(channel_links: list[dict]) -> tuple[list[dict], list
     return movable, retained
 
 
+def find_quest_users_for_location(users: list[dict], original_location_id: str) -> list[dict]:
+    """Quest users: exactly one allowed location, and it is this original location."""
+    matches = []
+    for user in users:
+        linked = user.get("locations") or []
+        if len(linked) == 1 and linked[0] == original_location_id:
+            matches.append(user)
+    return matches
+
+
+def build_users_by_location(users: list[dict]) -> dict[str, list[dict]]:
+    """Index Quest users (exactly one location) by that location id."""
+    by_location: dict[str, list[dict]] = {}
+    for user in users:
+        linked = user.get("locations") or []
+        if len(linked) != 1:
+            continue
+        location_id = linked[0]
+        by_location.setdefault(location_id, []).append(user)
+    return by_location
+
+
 def get_match_name(location: dict) -> str:
     """Location name used for matching, with any #MIGRATEDTO…# marker removed."""
     name = location.get("name") or ""
@@ -54,11 +79,16 @@ def get_match_name(location: dict) -> str:
 
 
 def migrated_marker(destination_location_id: str) -> str:
-    return f"#MIGRATED{destination_location_id}#"
+    return f"#MIGRATEDTO{destination_location_id}#"
 
 
 def has_migrated_marker(name: str) -> bool:
     return bool(MIGRATED_MARKER_RE.search(name or ""))
+
+
+def strip_migrated_marker(name: str) -> str:
+    """Remove any #MIGRATED…# / #MIGRATEDTO…# suffix from a location name."""
+    return MIGRATED_MARKER_RE.sub("", name or "").strip()
 
 
 def apply_migrated_marker(name: str, destination_location_id: str) -> str:
@@ -82,6 +112,13 @@ def _require_accounts(original_account_id: str, destination_account_id: str):
         raise AccountMoveGuardrailError("Original account ID is required.")
     if not destination_account_id or not destination_account_id.strip():
         raise AccountMoveGuardrailError("Destination account ID is required.")
+
+
+def _require_role_group(role_group_id: str):
+    if not role_group_id or not str(role_group_id).strip():
+        raise AccountMoveGuardrailError(
+            "Destination role ID is required before moving Quest users."
+        )
 
 
 def validate_location_belongs(location: dict, account_id: str, label: str = "Location"):
@@ -164,8 +201,12 @@ def classify_account_locations(
     original_locations: list[dict],
     destination_locations: list[dict],
     original_account_id: str,
+    original_users: Optional[list[dict]] = None,
 ) -> list[dict]:
     dest_index = build_destination_index(destination_locations)
+    if original_users is None:
+        original_users = list_all_users(original_account_id)
+    users_by_location = build_users_by_location(original_users)
     rows = []
     for original in original_locations:
         match_name = get_match_name(original)
@@ -174,6 +215,7 @@ def classify_account_locations(
         all_channel_links = _load_channel_links_for_location(original, original_account_id)
         movable, retained = partition_channel_links(all_channel_links)
         status = classify_location(original, destination, movable_channel_links=movable)
+        quest_users = users_by_location.get(original["_id"], [])
 
         rows.append(
             {
@@ -185,6 +227,7 @@ def classify_account_locations(
                 "retained_channel_link_ids": [item["_id"] for item in retained],
                 "channel_links": movable,
                 "retained_channel_links": retained,
+                "users": quest_users,
             }
         )
     return rows
@@ -195,6 +238,7 @@ def fetch_move_snapshot(
     original_account_id: str,
     destination_account_id: str,
     destination_locations: Optional[list[dict]] = None,
+    original_users: Optional[list[dict]] = None,
 ) -> dict:
     _require_accounts(original_account_id, destination_account_id)
 
@@ -223,11 +267,16 @@ def fetch_move_snapshot(
     if destination is not None:
         validate_location_belongs(destination, destination_account_id, "Destination location")
 
+    if original_users is None:
+        original_users = list_all_users(original_account_id)
+    quest_users = find_quest_users_for_location(original_users, original_location_id)
+
     return {
         "original_location": original,
         "destination_location": destination,
         "channel_links": movable,
         "retained_channel_links": retained,
+        "users": quest_users,
         "match_name": match_name,
         "status": status,
     }
@@ -238,8 +287,12 @@ def create_account_move_backup_zip(
     original_account_id: str,
     destination_account_id: str,
     mode: str,
-) -> tuple[bytes, str]:
-    """Build a backup zip from a list of move snapshots (fetch_move_snapshot results)."""
+) -> tuple[bytes, str, dict]:
+    """Build a backup zip from move snapshots.
+
+    Includes every channel link on the original location (movable + retained Test Channel).
+    Returns (zip_bytes, filename, summary).
+    """
     _require_accounts(original_account_id, destination_account_id)
     if not moves:
         raise RuntimeError("No moves to back up.")
@@ -253,6 +306,9 @@ def create_account_move_backup_zip(
         filename = f"account_move_backup_{mode}_{len(moves)}_locations_{timestamp}.zip"
 
     manifest_moves = []
+    total_channel_links = 0
+    total_movable = 0
+    total_users = 0
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
         for move in moves:
@@ -265,20 +321,63 @@ def create_account_move_backup_zip(
             original_id = original["_id"]
             prefix = f"moves/{original_id}"
 
+            movable = list(move.get("channel_links") or [])
+            retained = list(move.get("retained_channel_links") or [])
+            users = list(move.get("users") or [])
+            by_id = {}
+            for channel_link in movable + retained:
+                channel_link_id = channel_link.get("_id")
+                if not channel_link_id:
+                    raise RuntimeError(
+                        f"Channel link missing _id while backing up location {original_id}."
+                    )
+                by_id[channel_link_id] = channel_link
+
+            # Also include any IDs listed on the location that were not partitioned
+            # (should not happen, but keeps the zip complete).
+            for channel_link_id in original.get("channelLinks") or []:
+                if channel_link_id not in by_id:
+                    channel_link, status = get_channel_link(channel_link_id)
+                    if status != 200:
+                        raise RuntimeError(
+                            f"Failed to fetch channel link {channel_link_id} for backup: "
+                            f"HTTP {status}"
+                        )
+                    by_id[channel_link_id] = channel_link
+
             archive.writestr(
                 f"{prefix}/original_location.json",
-                json.dumps(original, indent=2),
+                json.dumps(original, indent=2, default=str),
             )
             archive.writestr(
                 f"{prefix}/destination_location.json",
-                json.dumps(destination, indent=2),
+                json.dumps(destination, indent=2, default=str),
             )
-            for channel_link in move["channel_links"]:
+
+            all_ids = list(by_id.keys())
+            movable_ids = [item["_id"] for item in movable]
+            for channel_link_id, channel_link in by_id.items():
                 archive.writestr(
-                    f"{prefix}/channelLinks/{channel_link['_id']}.json",
-                    json.dumps(channel_link, indent=2),
+                    f"{prefix}/channelLinks/{channel_link_id}.json",
+                    json.dumps(channel_link, indent=2, default=str),
                 )
 
+            user_ids = []
+            for user in users:
+                user_id = user.get("_id")
+                if not user_id:
+                    raise RuntimeError(
+                        f"User missing _id while backing up location {original_id}."
+                    )
+                user_ids.append(user_id)
+                archive.writestr(
+                    f"{prefix}/users/{user_id}.json",
+                    json.dumps(user, indent=2, default=str),
+                )
+
+            total_channel_links += len(all_ids)
+            total_movable += len(movable_ids)
+            total_users += len(user_ids)
             manifest_moves.append(
                 {
                     "original_location_id": original_id,
@@ -286,7 +385,10 @@ def create_account_move_backup_zip(
                     "destination_location_id": destination["_id"],
                     "destination_location_name": destination.get("name"),
                     "match_name": move.get("match_name"),
-                    "channel_link_ids": [item["_id"] for item in move["channel_links"]],
+                    "channel_link_ids": all_ids,
+                    "movable_channel_link_ids": movable_ids,
+                    "retained_channel_link_ids": [item["_id"] for item in retained],
+                    "user_ids": user_ids,
                 }
             )
 
@@ -296,11 +398,25 @@ def create_account_move_backup_zip(
             "original_account_id": original_account_id,
             "destination_account_id": destination_account_id,
             "created_at": datetime.now(timezone.utc).isoformat(),
+            "location_count": len(manifest_moves),
+            "channel_link_count": total_channel_links,
+            "movable_channel_link_count": total_movable,
+            "user_count": total_users,
             "moves": manifest_moves,
         }
-        archive.writestr("manifest.json", json.dumps(manifest, indent=2))
+        archive.writestr("manifest.json", json.dumps(manifest, indent=2, default=str))
 
-    return buffer.getvalue(), filename
+    buffer.seek(0)
+    zip_bytes = buffer.getvalue()
+    summary = {
+        "filename": filename,
+        "location_count": len(manifest_moves),
+        "channel_link_count": total_channel_links,
+        "movable_channel_link_count": total_movable,
+        "user_count": total_users,
+        "size_bytes": len(zip_bytes),
+    }
+    return zip_bytes, filename, summary
 
 
 def load_account_move_backup_zip(zip_bytes: bytes) -> dict:
@@ -317,16 +433,38 @@ def load_account_move_backup_zip(zip_bytes: bytes) -> dict:
             prefix = f"moves/{original_id}"
             original = json.loads(archive.read(f"{prefix}/original_location.json"))
             destination = json.loads(archive.read(f"{prefix}/destination_location.json"))
+
+            all_ids = entry.get("channel_link_ids") or []
+            movable_ids = entry.get("movable_channel_link_ids")
+            if movable_ids is None:
+                # Older backups only stored movable links under channel_link_ids.
+                movable_ids = all_ids
+
             channel_links = []
-            for channel_link_id in entry["channel_link_ids"]:
+            for channel_link_id in movable_ids:
                 channel_links.append(
                     json.loads(archive.read(f"{prefix}/channelLinks/{channel_link_id}.json"))
                 )
+
+            retained_channel_links = []
+            for channel_link_id in entry.get("retained_channel_link_ids") or []:
+                path = f"{prefix}/channelLinks/{channel_link_id}.json"
+                if path in archive.namelist():
+                    retained_channel_links.append(json.loads(archive.read(path)))
+
+            users = []
+            for user_id in entry.get("user_ids") or []:
+                path = f"{prefix}/users/{user_id}.json"
+                if path in archive.namelist():
+                    users.append(json.loads(archive.read(path)))
+
             moves.append(
                 {
                     "original_location": original,
                     "destination_location": destination,
                     "channel_links": channel_links,
+                    "retained_channel_links": retained_channel_links,
+                    "users": users,
                     "match_name": entry.get("match_name"),
                 }
             )
@@ -373,12 +511,26 @@ def _move_single_location(
     original_account_id: str,
     destination_account_id: str,
     retained_channel_link_ids: Optional[list] = None,
+    users: Optional[list] = None,
+    role_group_id: Optional[str] = None,
+    on_progress=None,
 ) -> list[dict]:
     results = []
     original_id = original["_id"]
     destination_id = destination["_id"]
     original_name = original.get("name", original_id)
+    destination_name = destination.get("name", destination_id)
     retained_channel_link_ids = list(retained_channel_link_ids or [])
+    location_meta = {
+        "original_location_id": original_id,
+        "original_location_name": original_name,
+        "destination_location_id": destination_id,
+        "destination_location_name": destination_name,
+    }
+
+    def _progress(message: str):
+        if on_progress:
+            on_progress(message)
 
     if not channel_link_ids:
         results.append(
@@ -388,11 +540,12 @@ def _move_single_location(
                     f"Location {original_name} has no channel links to move "
                     "(Test Channel is left in place) — skipped."
                 ),
+                **location_meta,
             }
         )
         return results
 
-    # Refresh etags before mutating
+    _progress(f"Refreshing {original_name}…")
     current_original, original_status = get_location(original_id)
     if original_status != 200:
         results.append(
@@ -403,6 +556,7 @@ def _move_single_location(
                 "action": f"Failed to refresh original location {original_name}",
                 "status": original_status,
                 "ok": False,
+                **location_meta,
             }
         )
         return results
@@ -413,10 +567,11 @@ def _move_single_location(
             {
                 "type": "location",
                 "id": destination_id,
-                "name": destination.get("name"),
-                "action": f"Failed to refresh destination location {destination.get('name')}",
+                "name": destination_name,
+                "action": f"Failed to refresh destination location {destination_name}",
                 "status": destination_status,
                 "ok": False,
+                **location_meta,
             }
         )
         return results
@@ -437,8 +592,10 @@ def _move_single_location(
                     "status": channel_status,
                     "ok": False,
                     "action": f"Failed to fetch channel link {channel_link_id}",
+                    **location_meta,
                 }
             )
+            _progress(f"{original_name}: failed to fetch channel link")
             continue
 
         if is_retained_test_channel(channel_link):
@@ -448,12 +605,15 @@ def _move_single_location(
                     "message": (
                         f"Leaving Test Channel ({channel_link_id}) on {original_name}."
                     ),
+                    **location_meta,
                 }
             )
             if channel_link_id not in retained_channel_link_ids:
                 retained_channel_link_ids.append(channel_link_id)
             continue
 
+        cl_label = channel_link.get("name") or channel_link_id
+        _progress(f"{original_name}: moving {cl_label}…")
         response_data, response_status = patch_channel_link(
             channel_link_id,
             {"account": destination_account_id, "location": destination_id},
@@ -468,12 +628,13 @@ def _move_single_location(
                 "id": channel_link_id,
                 "name": channel_link.get("name"),
                 "action": (
-                    f"Moved channel link {channel_link.get('name') or channel_link_id} "
-                    f"from {original_name} → {current_destination.get('name')}."
+                    f"Moved channel link {cl_label} "
+                    f"from {original_name} → {destination_name}."
                 ),
                 "status": response_status,
                 "ok": ok,
                 "response": response_data,
+                **location_meta,
             }
         )
 
@@ -485,10 +646,12 @@ def _move_single_location(
                     f"Location {original_name} had nothing to move after skipping "
                     "Test Channel — skipped without renaming."
                 ),
+                **location_meta,
             }
         )
         return results
 
+    _progress(f"{original_name}: updating original location…")
     new_name = apply_migrated_marker(current_original.get("name", ""), destination_id)
     original_payload = {"channelLinks": retained_channel_link_ids, "name": new_name}
     original_response, original_patch_status = patch_location(
@@ -506,6 +669,7 @@ def _move_single_location(
             "type": "location",
             "id": original_id,
             "name": new_name,
+            "role": "original",
             "action": (
                 f"Updated {original_name}: moved channel links away, renamed with "
                 f"{migrated_marker(destination_id)}."
@@ -514,6 +678,7 @@ def _move_single_location(
             "status": original_patch_status,
             "ok": 200 <= original_patch_status < 300,
             "response": original_response,
+            **location_meta,
         }
     )
 
@@ -522,7 +687,7 @@ def _move_single_location(
         if channel_link_id not in destination_links:
             destination_links.append(channel_link_id)
 
-    # Re-fetch destination for fresh etag after CL patches may have side effects
+    _progress(f"{original_name}: updating destination {destination_name}…")
     refreshed_destination, refreshed_status = get_location(destination_id)
     destination_etag = (
         refreshed_destination.get("_etag")
@@ -544,16 +709,103 @@ def _move_single_location(
         {
             "type": "location",
             "id": destination_id,
-            "name": current_destination.get("name"),
+            "name": destination_name,
+            "role": "destination",
             "action": (
-                f"Updated destination {current_destination.get('name')} with "
+                f"Updated destination {destination_name} with "
                 f"{len(destination_links)} channel link(s)."
             ),
             "status": destination_patch_status,
             "ok": 200 <= destination_patch_status < 300,
             "response": destination_response,
+            **location_meta,
         }
     )
+
+    quest_users = list(users or [])
+    if quest_users:
+        _require_role_group(role_group_id or "")
+        for user in quest_users:
+            user_id = user["_id"]
+            user_label = user.get("name") or user.get("email") or user_id
+            _progress(f"{original_name}: moving user {user_label}…")
+            current_user, user_status = get_user(user_id)
+            if user_status != 200:
+                results.append(
+                    {
+                        "type": "user",
+                        "id": user_id,
+                        "name": user_label,
+                        "action": f"Failed to fetch user {user_label}",
+                        "status": user_status,
+                        "ok": False,
+                        **location_meta,
+                    }
+                )
+                continue
+
+            if current_user.get("account") != original_account_id:
+                results.append(
+                    {
+                        "type": "warning",
+                        "message": (
+                            f"User {user_label} is not on the original account "
+                            f"({current_user.get('account')}) — skipped."
+                        ),
+                        **location_meta,
+                    }
+                )
+                continue
+
+            linked = current_user.get("locations") or []
+            if len(linked) != 1 or linked[0] != original_id:
+                results.append(
+                    {
+                        "type": "warning",
+                        "message": (
+                            f"User {user_label} is no longer a single-location Quest user "
+                            f"for {original_name} — skipped."
+                        ),
+                        **location_meta,
+                    }
+                )
+                continue
+
+            user_payload = {
+                "account": destination_account_id,
+                "locations": [destination_id],
+                "role": role_group_id,
+            }
+            user_response, user_patch_status = patch_user(
+                user_id,
+                user_payload,
+                current_user.get("_etag"),
+            )
+            results.append(
+                {
+                    "type": "user",
+                    "id": user_id,
+                    "name": user_label,
+                    "action": (
+                        f"Moved user {user_label} to destination account / "
+                        f"{destination_name} with role {role_group_id}."
+                    ),
+                    "status": user_patch_status,
+                    "ok": 200 <= user_patch_status < 300,
+                    "response": user_response,
+                    **location_meta,
+                }
+            )
+    elif role_group_id:
+        results.append(
+            {
+                "type": "warning",
+                "message": (
+                    f"No Quest users (exactly 1 location) linked to {original_name}."
+                ),
+                **location_meta,
+            }
+        )
 
     return results
 
@@ -562,43 +814,83 @@ def run_account_move(
     original_location_ids: list[str],
     original_account_id: str,
     destination_account_id: str,
+    role_group_id: str,
+    on_progress=None,
 ) -> list[dict]:
     _require_accounts(original_account_id, destination_account_id)
+    _require_role_group(role_group_id)
     destination_locations = list_all_locations(destination_account_id)
+    original_users = list_all_users(original_account_id)
     results = []
+    total = max(len(original_location_ids), 1)
+    step = 0
 
-    for original_location_id in original_location_ids:
+    def _report(message: str, location_index: Optional[int] = None):
+        if not on_progress:
+            return
+        # Tick within the current location's share of the bar.
+        if location_index is None:
+            on_progress(step / total, message)
+        else:
+            # Nudge forward slightly within this location's slice as substeps happen.
+            base = location_index / total
+            span = 1 / total
+            on_progress(min(base + span * 0.85, (location_index + 1) / total), message)
+
+    for index, original_location_id in enumerate(original_location_ids):
+        _report(f"Loading location {original_location_id}…", index)
         try:
             snapshot = fetch_move_snapshot(
                 original_location_id,
                 original_account_id,
                 destination_account_id,
                 destination_locations=destination_locations,
+                original_users=original_users,
             )
         except (AccountMoveGuardrailError, RuntimeError) as error:
             results.append(
                 {
                     "type": "warning",
                     "message": str(error),
+                    "original_location_id": original_location_id,
+                    "original_location_name": original_location_id,
                 }
             )
+            step += 1
+            _report(f"Skipped {original_location_id}", index)
+            if on_progress:
+                on_progress((index + 1) / total, f"Finished {index + 1}/{total}")
             continue
 
+        original_name = snapshot["original_location"].get("name", original_location_id)
+        destination = snapshot.get("destination_location")
+        location_meta = {
+            "original_location_id": original_location_id,
+            "original_location_name": original_name,
+            "destination_location_id": destination.get("_id") if destination else None,
+            "destination_location_name": destination.get("name") if destination else None,
+        }
+
         if snapshot["status"] == "already_moved":
-            name = snapshot["original_location"].get("name")
             retained = snapshot.get("retained_channel_links") or []
             if retained and not snapshot.get("channel_links"):
                 message = (
-                    f"Location {name} ({original_location_id}) skipped — "
+                    f"Location {original_name} ({original_location_id}) skipped — "
                     "only Test Channel remains (left in place)."
                 )
             else:
                 message = (
-                    f"Location {name} ({original_location_id}) has already been moved "
+                    f"Location {original_name} ({original_location_id}) has already been moved "
                     "(no channel links to move)."
                 )
-            results.append({"type": "warning", "message": message})
+            results.append({"type": "warning", "message": message, **location_meta})
+            step += 1
+            if on_progress:
+                on_progress((index + 1) / total, f"Skipped {original_name}")
             continue
+
+        def _location_progress(message: str, _index=index):
+            _report(message, _index)
 
         results.extend(
             _move_single_location(
@@ -610,9 +902,17 @@ def run_account_move(
                 retained_channel_link_ids=[
                     item["_id"] for item in snapshot.get("retained_channel_links") or []
                 ],
+                users=snapshot.get("users") or [],
+                role_group_id=role_group_id,
+                on_progress=_location_progress,
             )
         )
+        step += 1
+        if on_progress:
+            on_progress((index + 1) / total, f"Done {original_name} ({index + 1}/{total})")
 
+    if on_progress:
+        on_progress(1.0, "Finished")
     return results
 
 
@@ -620,16 +920,33 @@ def run_account_move_revert(
     backup: dict,
     original_account_id: str,
     destination_account_id: str,
+    on_progress=None,
 ) -> list[dict]:
     validate_account_move_backup(backup, original_account_id, destination_account_id)
     results = []
+    moves = backup["moves"]
+    total = max(len(moves), 1)
 
-    for move in backup["moves"]:
+    for index, move in enumerate(moves):
         original = move["original_location"]
         destination = move["destination_location"]
         original_id = original["_id"]
         destination_id = destination["_id"]
         channel_links = move["channel_links"]
+        original_name = strip_migrated_marker(original.get("name") or original_id)
+        destination_name = destination.get("name") or destination_id
+        location_meta = {
+            "original_location_id": original_id,
+            "original_location_name": original_name,
+            "destination_location_id": destination_id,
+            "destination_location_name": destination_name,
+        }
+
+        def _progress(message: str):
+            if on_progress:
+                on_progress((index + 0.5) / total, message)
+
+        _progress(f"Reverting {original_name}…")
 
         for channel_link in channel_links:
             channel_link_id = channel_link["_id"]
@@ -642,10 +959,15 @@ def run_account_move_revert(
                         "status": current_status,
                         "ok": False,
                         "action": f"Failed to fetch channel link {channel_link_id} for revert",
+                        **location_meta,
                     }
                 )
                 continue
 
+            _progress(
+                f"{original_name}: moving "
+                f"{channel_link.get('name') or channel_link_id} back…"
+            )
             # First move account/location back, then restore full snapshot
             patch_data, patch_status = patch_channel_link(
                 channel_link_id,
@@ -665,6 +987,7 @@ def run_account_move_revert(
                         "status": patch_status,
                         "ok": False,
                         "response": patch_data,
+                        **location_meta,
                     }
                 )
                 continue
@@ -677,7 +1000,8 @@ def run_account_move_revert(
                         "id": channel_link_id,
                         "status": refreshed_status,
                         "ok": False,
-                        "action": f"Moved CL back but failed to refresh before PUT",
+                        "action": "Moved CL back but failed to refresh before PUT",
+                        **location_meta,
                     }
                 )
                 continue
@@ -695,14 +1019,16 @@ def run_account_move_revert(
                     "name": channel_link.get("name"),
                     "action": (
                         f"Restored channel link {channel_link.get('name') or channel_link_id} "
-                        f"to original location {original.get('name')}."
+                        f"to original location {original_name}."
                     ),
                     "status": response_status,
                     "ok": 200 <= response_status < 300,
                     "response": response_data,
+                    **location_meta,
                 }
             )
 
+        # Restore both locations from the pre-move backup (name + channelLinks).
         current_original, original_status = get_location(original_id)
         if original_status != 200:
             results.append(
@@ -712,16 +1038,20 @@ def run_account_move_revert(
                     "status": original_status,
                     "ok": False,
                     "action": f"Failed to fetch original location {original_id} for revert",
+                    **location_meta,
                 }
             )
         else:
             validate_location_belongs(
                 current_original, original_account_id, "Original location"
             )
-            # Only restore fields we changed on migrate — avoid PUT of read-only fields
-            # like channelLinksDetails.
+            # Prefer backup name, always strip any leftover migration marker.
+            restored_original_name = strip_migrated_marker(
+                original.get("name") or current_original.get("name") or ""
+            )
+            _progress(f"{original_name}: restoring original name + channelLinks…")
             original_payload = {
-                "name": original.get("name"),
+                "name": restored_original_name,
                 "channelLinks": list(original.get("channelLinks") or []),
             }
             original_response, original_patch_status = patch_location(
@@ -733,14 +1063,16 @@ def run_account_move_revert(
                 {
                     "type": "location",
                     "id": original_id,
-                    "name": original.get("name"),
+                    "name": restored_original_name,
+                    "role": "original",
                     "action": (
-                        f"Restored original location {original.get('name')} "
-                        f"(name + channelLinks)."
+                        f"Restored original location to `{restored_original_name}` "
+                        f"(removed #MIGRATEDTO…# if present) and channelLinks."
                     ),
                     "status": original_patch_status,
                     "ok": 200 <= original_patch_status < 300,
                     "response": original_response,
+                    **location_meta,
                 }
             )
 
@@ -753,13 +1085,19 @@ def run_account_move_revert(
                     "status": destination_status,
                     "ok": False,
                     "action": f"Failed to fetch destination location {destination_id} for revert",
+                    **location_meta,
                 }
             )
         else:
             validate_location_belongs(
                 current_destination, destination_account_id, "Destination location"
             )
+            restored_destination_name = strip_migrated_marker(
+                destination.get("name") or current_destination.get("name") or ""
+            )
+            _progress(f"{original_name}: restoring destination channelLinks…")
             destination_payload = {
+                "name": restored_destination_name,
                 "channelLinks": list(destination.get("channelLinks") or []),
             }
             destination_response, destination_patch_status = patch_location(
@@ -771,15 +1109,68 @@ def run_account_move_revert(
                 {
                     "type": "location",
                     "id": destination_id,
-                    "name": destination.get("name"),
+                    "name": restored_destination_name,
+                    "role": "destination",
                     "action": (
-                        f"Restored destination location {destination.get('name')} "
-                        f"channelLinks."
+                        f"Restored destination location `{restored_destination_name}` "
+                        f"(name + channelLinks)."
                     ),
                     "status": destination_patch_status,
                     "ok": 200 <= destination_patch_status < 300,
                     "response": destination_response,
+                    **location_meta,
                 }
             )
 
+        for user in move.get("users") or []:
+            user_id = user["_id"]
+            user_label = user.get("name") or user.get("email") or user_id
+            _progress(f"{original_name}: restoring user {user_label}…")
+            current_user, user_status = get_user(user_id)
+            if user_status != 200:
+                results.append(
+                    {
+                        "type": "user",
+                        "id": user_id,
+                        "name": user_label,
+                        "action": f"Failed to fetch user {user_label} for revert",
+                        "status": user_status,
+                        "ok": False,
+                        **location_meta,
+                    }
+                )
+                continue
+
+            user_payload = {
+                "account": original_account_id,
+                "locations": list(user.get("locations") or [original_id]),
+            }
+            if "role" in user:
+                user_payload["role"] = user.get("role")
+            user_response, user_patch_status = patch_user(
+                user_id,
+                user_payload,
+                current_user.get("_etag"),
+            )
+            results.append(
+                {
+                    "type": "user",
+                    "id": user_id,
+                    "name": user_label,
+                    "action": (
+                        f"Restored user {user_label} to original account / "
+                        f"{original_name}."
+                    ),
+                    "status": user_patch_status,
+                    "ok": 200 <= user_patch_status < 300,
+                    "response": user_response,
+                    **location_meta,
+                }
+            )
+
+        if on_progress:
+            on_progress((index + 1) / total, f"Reverted {original_name} ({index + 1}/{total})")
+
+    if on_progress:
+        on_progress(1.0, "Finished")
     return results

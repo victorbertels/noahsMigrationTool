@@ -423,6 +423,224 @@ def show_results(results: list[dict]):
                     st.write(failure)
 
 
+def summarize_account_move_locations(
+    results: list[dict],
+    success_label: str = "Fully migrated",
+) -> list[dict]:
+    """Collapse step results into one row per original location."""
+    by_location: dict[str, dict] = {}
+
+    for result in results:
+        location_id = result.get("original_location_id") or result.get("id") or "unknown"
+        if location_id not in by_location:
+            by_location[location_id] = {
+                "original_location_id": location_id,
+                "original_location_name": result.get("original_location_name")
+                or result.get("name")
+                or location_id,
+                "destination_location_id": result.get("destination_location_id"),
+                "destination_location_name": result.get("destination_location_name"),
+                "channel_ok": 0,
+                "channel_fail": 0,
+                "channel_total": 0,
+                "user_ok": 0,
+                "user_fail": 0,
+                "user_total": 0,
+                "location_ok": True,
+                "had_location_step": False,
+                "skipped": False,
+                "channel_rows": [],
+                "user_rows": [],
+                "failures": [],
+            }
+
+        bucket = by_location[location_id]
+        if result.get("destination_location_name"):
+            bucket["destination_location_name"] = result["destination_location_name"]
+        if result.get("destination_location_id"):
+            bucket["destination_location_id"] = result["destination_location_id"]
+        if result.get("original_location_name"):
+            bucket["original_location_name"] = result["original_location_name"]
+
+        if result.get("type") == "warning":
+            if (
+                bucket["channel_total"] == 0
+                and bucket["user_total"] == 0
+                and not bucket["had_location_step"]
+            ):
+                bucket["skipped"] = True
+            continue
+
+        if result.get("type") == "channel_link":
+            bucket["skipped"] = False
+            bucket["channel_total"] += 1
+            bucket["channel_rows"].append(
+                {
+                    "Status": "🟢" if result.get("ok") else "🔴",
+                    "Channel": result.get("name") or result.get("id") or "",
+                    "Detail": result.get("action") or "",
+                    "HTTP": result.get("status", ""),
+                }
+            )
+            if result.get("ok"):
+                bucket["channel_ok"] += 1
+            else:
+                bucket["channel_fail"] += 1
+                bucket["failures"].append(result)
+            continue
+
+        if result.get("type") == "user":
+            bucket["skipped"] = False
+            bucket["user_total"] += 1
+            bucket["user_rows"].append(
+                {
+                    "Status": "🟢" if result.get("ok") else "🔴",
+                    "User": result.get("name") or result.get("id") or "",
+                    "Detail": result.get("action") or "",
+                    "HTTP": result.get("status", ""),
+                }
+            )
+            if result.get("ok"):
+                bucket["user_ok"] += 1
+            else:
+                bucket["user_fail"] += 1
+                bucket["failures"].append(result)
+            continue
+
+        if result.get("type") == "location":
+            bucket["had_location_step"] = True
+            bucket["skipped"] = False
+            if not result.get("ok"):
+                bucket["location_ok"] = False
+                bucket["failures"].append(result)
+
+    overview = []
+    for bucket in by_location.values():
+        if bucket["skipped"] and not bucket["had_location_step"]:
+            status, outcome = "🟡", "Skipped"
+        elif (
+            bucket["location_ok"]
+            and bucket["channel_fail"] == 0
+            and bucket["user_fail"] == 0
+        ):
+            status, outcome = "🟢", success_label
+        elif bucket["channel_ok"] > 0 or bucket["user_ok"] > 0:
+            status, outcome = "🟠", "Partial"
+        else:
+            status, outcome = "🔴", "Failed"
+
+        overview.append(
+            {
+                "Status": status,
+                "Location": bucket["original_location_name"],
+                "Destination": bucket["destination_location_name"] or "",
+                "Channels": (
+                    f"{bucket['channel_ok']}/{bucket['channel_total']}"
+                    if bucket["channel_total"]
+                    else "—"
+                ),
+                "Users": (
+                    f"{bucket['user_ok']}/{bucket['user_total']}"
+                    if bucket["user_total"]
+                    else "—"
+                ),
+                "Outcome": outcome,
+                "_bucket": bucket,
+            }
+        )
+    return overview
+
+
+def show_account_move_results(
+    results: list[dict],
+    title: str = "Location overview",
+    success_label: str = "Fully migrated",
+):
+    if not results:
+        return
+
+    overview = summarize_account_move_locations(results, success_label=success_label)
+    fully = sum(1 for row in overview if row["Outcome"] == success_label)
+    partial = sum(1 for row in overview if row["Outcome"] == "Partial")
+    failed = sum(1 for row in overview if row["Outcome"] == "Failed")
+    skipped = sum(1 for row in overview if row["Outcome"] == "Skipped")
+
+    with st.container(border=True):
+        st.markdown(f"**{title}**")
+
+        if failed == 0 and partial == 0 and fully:
+            detail = f"{fully} location(s) {success_label.lower()}"
+            if skipped:
+                detail += f" · {skipped} skipped"
+            st.markdown(
+                f'<div class="match-all-good"><strong>Complete</strong>'
+                f"<span>{detail}</span></div>",
+                unsafe_allow_html=True,
+            )
+        elif failed or partial:
+            st.error(
+                f"{fully} {success_label.lower()} · {partial} partial · "
+                f"{failed} failed · {skipped} skipped"
+            )
+        else:
+            st.info(f"{skipped} location(s) skipped · nothing changed")
+
+        st.dataframe(
+            [
+                {
+                    "Status": row["Status"],
+                    "Location": row["Location"],
+                    "Destination": row["Destination"],
+                    "Channels": row["Channels"],
+                    "Users": row["Users"],
+                    "Outcome": row["Outcome"],
+                }
+                for row in overview
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        detail_rows = [
+            row
+            for row in overview
+            if row["_bucket"]["channel_rows"] or row["_bucket"]["user_rows"]
+        ]
+        if detail_rows:
+            with st.expander("Per-channel / user details", expanded=False):
+                for row in detail_rows:
+                    st.markdown(f"**{row['Location']}**")
+                    if row["_bucket"]["channel_rows"]:
+                        st.caption("Channel links")
+                        st.dataframe(
+                            row["_bucket"]["channel_rows"],
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+                    if row["_bucket"]["user_rows"]:
+                        st.caption("Users")
+                        st.dataframe(
+                            row["_bucket"]["user_rows"],
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+
+        failures = [
+            failure
+            for row in overview
+            for failure in row["_bucket"]["failures"]
+        ]
+        for failure in failures:
+            with st.expander(
+                f"Error details · {failure.get('name') or failure.get('id')}",
+                expanded=False,
+            ):
+                if failure.get("response"):
+                    st.json(failure["response"])
+                else:
+                    st.write(failure)
+
+
 def init_migrate_session_state():
     defaults = {
         "location_id_input": "",
@@ -452,6 +670,10 @@ def init_account_move_session_state():
         "am_mode": "per_location",
         "am_old_account_id": "",
         "am_new_account_id": "",
+        "am_role_group_id": "",
+        "am_role_name": None,
+        "am_roles": None,
+        "am_roles_account_id": None,
         "am_accounts_confirmed": False,
         "am_location_id_input": "",
         "am_location_id": None,
@@ -459,6 +681,7 @@ def init_account_move_session_state():
         "am_match_name": None,
         "am_channel_link_count": 0,
         "am_retained_count": 0,
+        "am_user_count": 0,
         "am_destination_id": None,
         "am_destination_name": None,
         "am_status": None,
@@ -466,6 +689,7 @@ def init_account_move_session_state():
         "am_confirmed": False,
         "am_backup_bytes": None,
         "am_backup_filename": None,
+        "am_backup_summary": None,
         "am_backup_downloaded": False,
         "am_rest_rows": None,
         "am_rest_loaded": False,
@@ -492,6 +716,7 @@ def reset_account_move_per_location():
     st.session_state.am_match_name = None
     st.session_state.am_channel_link_count = 0
     st.session_state.am_retained_count = 0
+    st.session_state.am_user_count = 0
     st.session_state.am_destination_id = None
     st.session_state.am_destination_name = None
     st.session_state.am_status = None
@@ -499,6 +724,7 @@ def reset_account_move_per_location():
     st.session_state.am_confirmed = False
     st.session_state.am_backup_bytes = None
     st.session_state.am_backup_filename = None
+    st.session_state.am_backup_summary = None
     st.session_state.am_backup_downloaded = False
 
 
@@ -508,11 +734,16 @@ def reset_account_move_rest():
     st.session_state.am_rest_snapshots = None
     st.session_state.am_backup_bytes = None
     st.session_state.am_backup_filename = None
+    st.session_state.am_backup_summary = None
     st.session_state.am_backup_downloaded = False
 
 
 def reset_account_move_from_accounts_change():
     st.session_state.am_accounts_confirmed = False
     st.session_state.am_location_id_input = ""
+    st.session_state.am_roles = None
+    st.session_state.am_roles_account_id = None
+    st.session_state.am_role_group_id = ""
+    st.session_state.am_role_name = None
     reset_account_move_per_location()
     reset_account_move_rest()
