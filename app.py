@@ -718,7 +718,7 @@ def _account_move_per_location_confirm(original_account_id: str, destination_acc
             primary_label="Continue to backup",
             primary_key="am_continue_backup_per",
             primary_disabled=not can_continue,
-            primary_step=4 if can_continue else None,
+            primary_step=4,
         )
 
 
@@ -819,7 +819,7 @@ def _account_move_rest_confirm(original_account_id: str, destination_account_id:
             primary_label="Continue to backup",
             primary_key="am_continue_backup_rest",
             primary_disabled=not can_continue,
-            primary_step=4 if can_continue else None,
+            primary_step=4,
         )
 
 
