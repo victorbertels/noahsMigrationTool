@@ -368,33 +368,83 @@ QUEST_MIGRATE_WIZARD_STEPS = [
 
 
 def account_move_current_step() -> int:
-    """1-based wizard step for Account Move, based on session gates."""
-    if not st.session_state.get("am_accounts_confirmed"):
-        return 1
-    if st.session_state.get("am_mode") == "per_location":
-        if not st.session_state.get("am_location_id"):
-            return 2
-        if not st.session_state.get("am_confirmed"):
-            return 3
-        if not st.session_state.get("am_backup_downloaded"):
-            return 4
-        return 5
-    # rest_of_account
-    if not st.session_state.get("am_rest_loaded"):
-        return 3
-    if not st.session_state.get("am_backup_downloaded"):
-        if not st.session_state.get("am_backup_bytes"):
-            return 3
-        return 4
-    return 5
+    """Currently viewed Account Move wizard step (1-based)."""
+    step = int(st.session_state.get("am_wizard_step") or 1)
+    return max(1, min(step, 5))
 
 
 def quest_migrate_current_step() -> int:
-    if not st.session_state.get("location_confirmed"):
-        return 1
-    if not st.session_state.get("backup_downloaded"):
-        return 2
-    return 3
+    """Currently viewed Quest migrate wizard step (1-based)."""
+    step = int(st.session_state.get("qm_wizard_step") or 1)
+    return max(1, min(step, 3))
+
+
+def set_account_move_step(step: int):
+    st.session_state.am_wizard_step = max(1, min(int(step), 5))
+
+
+def set_quest_migrate_step(step: int):
+    st.session_state.qm_wizard_step = max(1, min(int(step), 3))
+
+
+def wizard_back_button(label: str = "← Back", *, key: str, target_step: int, kind: str = "account_move"):
+    """Render a back button that moves the wizard view to target_step."""
+    if st.button(label, use_container_width=True, key=key):
+        if kind == "quest_migrate":
+            set_quest_migrate_step(target_step)
+        else:
+            set_account_move_step(target_step)
+        st.rerun()
+
+
+def wizard_nav_row(
+    *,
+    back_step: int = None,
+    back_key: str = None,
+    primary_label: str = None,
+    primary_key: str = None,
+    primary_disabled: bool = False,
+    primary_step: int = None,
+    kind: str = "account_move",
+):
+    """Optional Back + optional primary Continue that advances the wizard."""
+    show_back = back_step is not None and back_key
+    show_primary = primary_label and primary_key and primary_step is not None
+    if not show_back and not show_primary:
+        return
+
+    if show_back and show_primary:
+        back_col, primary_col = st.columns(2)
+        with back_col:
+            wizard_back_button(key=back_key, target_step=back_step, kind=kind)
+        with primary_col:
+            if st.button(
+                primary_label,
+                type="primary",
+                use_container_width=True,
+                disabled=primary_disabled,
+                key=primary_key,
+            ):
+                if kind == "quest_migrate":
+                    set_quest_migrate_step(primary_step)
+                else:
+                    set_account_move_step(primary_step)
+                st.rerun()
+    elif show_back:
+        wizard_back_button(key=back_key, target_step=back_step, kind=kind)
+    else:
+        if st.button(
+            primary_label,
+            type="primary",
+            use_container_width=True,
+            disabled=primary_disabled,
+            key=primary_key,
+        ):
+            if kind == "quest_migrate":
+                set_quest_migrate_step(primary_step)
+            else:
+                set_account_move_step(primary_step)
+            st.rerun()
 
 
 def location_card(name: str, location_id: str):
@@ -840,6 +890,7 @@ def init_migrate_session_state():
         "backup_bytes": None,
         "backup_filename": None,
         "backup_downloaded": False,
+        "qm_wizard_step": 1,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -853,6 +904,7 @@ def reset_from_location_change():
     st.session_state.backup_bytes = None
     st.session_state.backup_filename = None
     st.session_state.backup_downloaded = False
+    st.session_state.qm_wizard_step = 1
 
 
 def init_account_move_session_state():
@@ -867,6 +919,7 @@ def init_account_move_session_state():
         "am_source_roles": None,
         "am_source_roles_account_id": None,
         "am_accounts_confirmed": False,
+        "am_wizard_step": 1,
         "am_location_id_input": "",
         "am_location_id": None,
         "am_location_name": None,
@@ -932,6 +985,7 @@ def reset_account_move_rest():
 
 def reset_account_move_from_accounts_change():
     st.session_state.am_accounts_confirmed = False
+    st.session_state.am_wizard_step = 1
     st.session_state.am_location_id_input = ""
     st.session_state.am_roles = None
     st.session_state.am_roles_account_id = None
