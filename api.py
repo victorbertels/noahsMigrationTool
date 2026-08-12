@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlencode
 
@@ -7,7 +8,7 @@ import requests
 from auth import getHeaders
 
 # Module version marker for deploy debugging (must include get_user).
-API_MODULE_VERSION = "2026-08-12-get-user"
+API_MODULE_VERSION = "2026-08-12-snooze-by-plus"
 
 BASE_URL = "https://api.deliverect.io"
 
@@ -235,3 +236,71 @@ def build_role_duplicate_payload(source_role: Dict, destination_account_id: str)
     if description:
         payload["description"] = description
     return payload
+
+
+def list_active_snoozes(account_id: str, location_id: str) -> List[Dict]:
+    """Fetch currently active channelDisabledProducts for a location."""
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    items: List[Dict] = []
+    page = 1
+    cursor = "new"
+
+    while True:
+        params = {
+            "where": json.dumps(
+                {
+                    "account": account_id,
+                    "location": location_id,
+                    "snoozeEnd": {"$gt": now},
+                }
+            ),
+            "max_results": 500,
+            "cursor": cursor,
+            "page": page,
+        }
+        response = _request("GET", "channelDisabledProducts", params=params)
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"Failed to list snoozes for location {location_id}: "
+                f"HTTP {response.status_code}"
+            )
+
+        data = response.json()
+        page_items = data.get("_items", data if isinstance(data, list) else [])
+        items.extend(page_items)
+
+        meta = data.get("_meta", {}) if isinstance(data, dict) else {}
+        total = meta.get("total")
+        if total is not None and len(items) >= total:
+            break
+        if len(page_items) < 500:
+            break
+
+        if page == 1 and meta.get("cursor"):
+            cursor = meta["cursor"]
+        page += 1
+
+    return items
+
+
+def snooze_by_plus(
+    account_id: str,
+    location_id: str,
+    plus: List[str],
+    snooze_start: str,
+    snooze_end: str,
+) -> Tuple[Dict, int]:
+    """POST /products/snoozeByPlus for the given PLUs on a location."""
+    payload = {
+        "account": account_id,
+        "location": location_id,
+        "plus": plus,
+        "snoozeStart": snooze_start,
+        "snoozeEnd": snooze_end,
+    }
+    response = _request("POST", "products/snoozeByPlus", payload=payload)
+    try:
+        data = response.json()
+    except ValueError:
+        data = {"raw": response.text}
+    return data, response.status_code

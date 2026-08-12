@@ -431,7 +431,8 @@ def _account_move_per_location(
             st.caption(
                 "Moves channel links to the destination account/location, clears them on the "
                 "original (except Test Channel), appends `#MIGRATEDTO{destinationId}#` to the "
-                "original name, and assigns each Quest user a matched or duplicated role."
+                "original name, assigns each Quest user a matched or duplicated role, and copies "
+                "active snoozed PLUs onto the destination via snoozeByPlus."
             )
             if st.button("Run account move", type="primary", use_container_width=True, key="am_run"):
                 try:
@@ -654,7 +655,8 @@ def _account_move_rest_of_account(
             )
             st.caption(
                 "Same as per-location: channel links move, original gets `#MIGRATEDTO…#`, "
-                "Quest users get a matched or duplicated role."
+                "Quest users get a matched or duplicated role, and active snoozed PLUs are "
+                "copied to the destination via snoozeByPlus."
             )
             if st.button(
                 "Run account move for ready locations",

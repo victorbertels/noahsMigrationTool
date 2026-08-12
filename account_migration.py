@@ -13,6 +13,7 @@ from api import (
     get_location,
     get_role,
     get_user,
+    list_active_snoozes,
     list_all_locations,
     list_all_roles,
     list_all_users,
@@ -21,6 +22,7 @@ from api import (
     patch_user,
     prepare_put_payload,
     put_channel_link,
+    snooze_by_plus,
 )
 
 MIGRATED_MARKER_RE = re.compile(r"#MIGRATED(?:TO)?[0-9a-fA-F]+#")
@@ -28,6 +30,9 @@ MIGRATED_MARKER_RE = re.compile(r"#MIGRATED(?:TO)?[0-9a-fA-F]+#")
 # Stays on the original location; destination already has its own copy.
 RETAINED_TEST_CHANNEL = 1
 RETAINED_TEST_CHANNEL_NAME = "Test Channel"
+
+# Batch size for POST /products/snoozeByPlus
+SNOOZE_PLUS_BATCH_SIZE = 100
 
 
 class AccountMoveGuardrailError(Exception):
@@ -309,6 +314,152 @@ def classify_location(
     if destination is None:
         return "unmatched"
     return "ready"
+
+
+def _iso_datetime(value) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, str) and value.strip():
+        return value
+    return None
+
+
+def _dedupe_snoozes_by_plu(snoozes: list[dict]) -> list[dict]:
+    """Keep one record per PLU, preferring the furthest snoozeEnd."""
+    by_plu: dict[str, dict] = {}
+    for item in snoozes:
+        plu = (item.get("plu") or "").strip()
+        if not plu:
+            continue
+        end = _iso_datetime(item.get("snoozeEnd")) or ""
+        existing = by_plu.get(plu)
+        if existing is None or end > (_iso_datetime(existing.get("snoozeEnd")) or ""):
+            by_plu[plu] = item
+    return list(by_plu.values())
+
+
+def copy_snoozes_to_destination(
+    original_account_id: str,
+    original_location_id: str,
+    destination_account_id: str,
+    destination_location_id: str,
+    location_meta: Optional[dict] = None,
+    on_progress=None,
+) -> list[dict]:
+    """Copy active snoozes from original location onto destination via snoozeByPlus."""
+    meta = location_meta or {}
+    original_name = meta.get("original_location_name") or original_location_id
+    destination_name = meta.get("destination_location_name") or destination_location_id
+
+    def _progress(message: str):
+        if on_progress:
+            on_progress(message)
+
+    _progress(f"{original_name}: loading snoozed products…")
+    try:
+        snoozes = list_active_snoozes(original_account_id, original_location_id)
+    except Exception as error:
+        return [
+            {
+                "type": "snooze",
+                "id": original_location_id,
+                "name": original_name,
+                "action": f"Failed to load snoozes from {original_name}: {error}",
+                "status": 0,
+                "ok": False,
+                "plu_count": 0,
+                **meta,
+            }
+        ]
+
+    unique = _dedupe_snoozes_by_plu(snoozes)
+    if not unique:
+        return [
+            {
+                "type": "snooze",
+                "id": original_location_id,
+                "name": original_name,
+                "action": f"No active snoozes on {original_name} to copy.",
+                "status": 200,
+                "ok": True,
+                "plu_count": 0,
+                **meta,
+            }
+        ]
+
+    # Group PLUs that share the same window so we can batch POSTs.
+    groups: dict[tuple[str, str], list[str]] = {}
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    for item in unique:
+        end = _iso_datetime(item.get("snoozeEnd"))
+        if not end:
+            continue
+        start = _iso_datetime(item.get("snoozeStart")) or now_iso
+        plu = (item.get("plu") or "").strip()
+        groups.setdefault((start, end), []).append(plu)
+
+    results = []
+    total_plus = sum(len(plus) for plus in groups.values())
+    uploaded = 0
+    _progress(
+        f"{original_name}: uploading {total_plus} snoozed PLU(s) to {destination_name}…"
+    )
+
+    for (start, end), plus_list in groups.items():
+        for offset in range(0, len(plus_list), SNOOZE_PLUS_BATCH_SIZE):
+            batch = plus_list[offset : offset + SNOOZE_PLUS_BATCH_SIZE]
+            response_data, status = snooze_by_plus(
+                destination_account_id,
+                destination_location_id,
+                batch,
+                start,
+                end,
+            )
+            ok = 200 <= status < 300
+            if ok:
+                uploaded += len(batch)
+            results.append(
+                {
+                    "type": "snooze",
+                    "id": destination_location_id,
+                    "name": destination_name,
+                    "action": (
+                        f"Snoozed {len(batch)} PLU(s) on {destination_name} "
+                        f"until {end}."
+                        if ok
+                        else (
+                            f"Failed to snooze {len(batch)} PLU(s) on "
+                            f"{destination_name} (HTTP {status})."
+                        )
+                    ),
+                    "status": status,
+                    "ok": ok,
+                    "plu_count": len(batch),
+                    "plus": batch,
+                    "response": response_data,
+                    **meta,
+                }
+            )
+
+    if results and all(item.get("ok") for item in results):
+        # Replace per-batch noise with one summary success when everything worked.
+        return [
+            {
+                "type": "snooze",
+                "id": destination_location_id,
+                "name": destination_name,
+                "action": (
+                    f"Copied {uploaded} snoozed PLU(s) from {original_name} "
+                    f"→ {destination_name} via snoozeByPlus."
+                ),
+                "status": 200,
+                "ok": True,
+                "plu_count": uploaded,
+                **meta,
+            }
+        ]
+
+    return results
 
 
 def _load_channel_links_for_location(
@@ -1000,6 +1151,17 @@ def _move_single_location(
                 **location_meta,
             }
         )
+
+    results.extend(
+        copy_snoozes_to_destination(
+            original_account_id,
+            original_id,
+            destination_account_id,
+            destination_id,
+            location_meta=location_meta,
+            on_progress=_progress,
+        )
+    )
 
     return results
 

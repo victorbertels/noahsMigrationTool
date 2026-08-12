@@ -638,11 +638,16 @@ def summarize_account_move_locations(
                 "user_ok": 0,
                 "user_fail": 0,
                 "user_total": 0,
+                "snooze_ok": 0,
+                "snooze_fail": 0,
+                "snooze_total": 0,
+                "snooze_plus": 0,
                 "location_ok": True,
                 "had_location_step": False,
                 "skipped": False,
                 "channel_rows": [],
                 "user_rows": [],
+                "snooze_rows": [],
                 "failures": [],
             }
 
@@ -699,6 +704,25 @@ def summarize_account_move_locations(
                 bucket["failures"].append(result)
             continue
 
+        if result.get("type") == "snooze":
+            bucket["skipped"] = False
+            bucket["snooze_total"] += 1
+            bucket["snooze_plus"] += int(result.get("plu_count") or 0)
+            bucket["snooze_rows"].append(
+                {
+                    "Status": "🟢" if result.get("ok") else "🔴",
+                    "Detail": result.get("action") or "",
+                    "PLUs": result.get("plu_count", ""),
+                    "HTTP": result.get("status", ""),
+                }
+            )
+            if result.get("ok"):
+                bucket["snooze_ok"] += 1
+            else:
+                bucket["snooze_fail"] += 1
+                bucket["failures"].append(result)
+            continue
+
         if result.get("type") == "location":
             bucket["had_location_step"] = True
             bucket["skipped"] = False
@@ -714,9 +738,10 @@ def summarize_account_move_locations(
             bucket["location_ok"]
             and bucket["channel_fail"] == 0
             and bucket["user_fail"] == 0
+            and bucket["snooze_fail"] == 0
         ):
             status, outcome = "🟢", success_label
-        elif bucket["channel_ok"] > 0 or bucket["user_ok"] > 0:
+        elif bucket["channel_ok"] > 0 or bucket["user_ok"] > 0 or bucket["snooze_ok"] > 0:
             status, outcome = "🟠", "Partial"
         else:
             status, outcome = "🔴", "Failed"
@@ -734,6 +759,11 @@ def summarize_account_move_locations(
                 "Users": (
                     f"{bucket['user_ok']}/{bucket['user_total']}"
                     if bucket["user_total"]
+                    else "—"
+                ),
+                "Snoozes": (
+                    str(bucket["snooze_plus"])
+                    if bucket["snooze_total"]
                     else "—"
                 ),
                 "Outcome": outcome,
@@ -785,6 +815,7 @@ def show_account_move_results(
                     "Destination": row["Destination"],
                     "Channels": row["Channels"],
                     "Users": row["Users"],
+                    "Snoozes": row["Snoozes"],
                     "Outcome": row["Outcome"],
                 }
                 for row in overview
@@ -796,10 +827,14 @@ def show_account_move_results(
         detail_rows = [
             row
             for row in overview
-            if row["_bucket"]["channel_rows"] or row["_bucket"]["user_rows"]
+            if (
+                row["_bucket"]["channel_rows"]
+                or row["_bucket"]["user_rows"]
+                or row["_bucket"]["snooze_rows"]
+            )
         ]
         if detail_rows:
-            with st.expander("Per-channel / user details", expanded=False):
+            with st.expander("Per-channel / user / snooze details", expanded=False):
                 for row in detail_rows:
                     st.markdown(f"**{row['Location']}**")
                     if row["_bucket"]["channel_rows"]:
@@ -813,6 +848,13 @@ def show_account_move_results(
                         st.caption("Users")
                         st.dataframe(
                             row["_bucket"]["user_rows"],
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+                    if row["_bucket"]["snooze_rows"]:
+                        st.caption("Snoozes")
+                        st.dataframe(
+                            row["_bucket"]["snooze_rows"],
                             use_container_width=True,
                             hide_index=True,
                         )
