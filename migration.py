@@ -4,7 +4,7 @@ import re
 import zipfile
 from datetime import datetime, timezone
 
-from deliverect_api import (
+from api import (
     get_channel_link,
     get_location,
     patch_channel_link,
