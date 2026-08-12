@@ -10,9 +10,11 @@ from account_migration import (
     AccountMoveGuardrailError,
     classify_account_locations,
     create_account_move_backup_zip,
+    ensure_destination_role_from_source,
     fetch_move_snapshot,
     has_migrated_marker,
     load_account_move_backup_zip,
+    role_resolution_result,
     run_account_move,
     run_account_move_revert,
 )
@@ -27,6 +29,9 @@ from migration import (
     validate_location_account,
 )
 from app_ui import (
+    ACCOUNT_MOVE_WIZARD_STEPS,
+    QUEST_MIGRATE_WIZARD_STEPS,
+    account_move_current_step,
     account_move_format_box,
     account_move_match_summary,
     apply_styles,
@@ -36,6 +41,7 @@ from app_ui import (
     init_migrate_session_state,
     load_credentials,
     location_card,
+    quest_migrate_current_step,
     render_header,
     render_nav,
     render_password_gate,
@@ -43,65 +49,109 @@ from app_ui import (
     reset_account_move_per_location,
     reset_account_move_rest,
     reset_from_location_change,
+    set_account_move_step,
+    set_quest_migrate_step,
     show_account_move_results,
     show_results,
     step_heading,
+    wizard_nav_row,
+    wizard_steps,
 )
 
 
 def migrate_page(allowed_account_id: str):
-    with st.container(border=True):
-        step_heading("Confirm location", "1")
-        location_id_input = st.text_input(
-            "Location ID",
-            value=st.session_state.location_id_input,
-            placeholder="6a2ad9de3547b47db45c7b3b",
-        )
+    step = quest_migrate_current_step()
+    # Keep the viewed step coherent with completed gates when going forward.
+    if step >= 2 and not st.session_state.location_confirmed:
+        set_quest_migrate_step(1)
+        step = 1
+    elif step >= 3 and not st.session_state.backup_downloaded:
+        set_quest_migrate_step(2)
+        step = 2
 
-        if location_id_input != st.session_state.location_id_input:
-            st.session_state.location_id_input = location_id_input
-            reset_from_location_change()
+    wizard_steps(
+        QUEST_MIGRATE_WIZARD_STEPS,
+        step,
+        note="Only <strong>Run migrate</strong> changes live data. Use Back to revisit earlier steps.",
+    )
 
-        if st.button("Look up location", disabled=not location_id_input, use_container_width=True):
-            track_event("location_lookup_started", action="migrate", location_id=location_id_input)
-            try:
-                location, status = get_location(location_id_input)
-                if status != 200:
-                    st.error(f"Could not find location (HTTP {status}).")
+    if step == 1:
+        with st.container(border=True):
+            step_heading("Confirm location", "1")
+            location_id_input = st.text_input(
+                "Location ID",
+                value=st.session_state.location_id_input,
+                placeholder="6a2ad9de3547b47db45c7b3b",
+            )
+
+            if location_id_input != st.session_state.location_id_input:
+                st.session_state.location_id_input = location_id_input
+                reset_from_location_change()
+
+            if st.button(
+                "Look up location",
+                disabled=not location_id_input,
+                use_container_width=True,
+            ):
+                track_event(
+                    "location_lookup_started",
+                    action="migrate",
+                    location_id=location_id_input,
+                )
+                try:
+                    location, status = get_location(location_id_input)
+                    if status != 200:
+                        st.error(f"Could not find location (HTTP {status}).")
+                    else:
+                        validate_location_account(location, allowed_account_id)
+                        st.session_state.location_id = location_id_input
+                        st.session_state.location_name = location.get("name", "Unknown")
+                        st.session_state.location_confirmed = False
+                        st.session_state.backup_bytes = None
+                        st.session_state.backup_filename = None
+                        st.session_state.backup_downloaded = False
+                except AccountGuardrailError as error:
+                    st.error(str(error))
+                except Exception as error:
+                    st.error(str(error))
+
+            if st.session_state.location_id and st.session_state.location_name:
+                location_card(st.session_state.location_name, st.session_state.location_id)
+
+                if not st.session_state.location_confirmed:
+                    confirm_col, cancel_col = st.columns(2)
+                    with confirm_col:
+                        if st.button(
+                            "Yes, this is the right location",
+                            type="primary",
+                            use_container_width=True,
+                        ):
+                            st.session_state.location_confirmed = True
+                            set_quest_migrate_step(2)
+                            track_event("location_confirmed", action="migrate")
+                            st.rerun()
+                    with cancel_col:
+                        if st.button("No, choose another", use_container_width=True):
+                            reset_from_location_change()
+                            st.session_state.location_id_input = ""
+                            st.rerun()
                 else:
-                    validate_location_account(location, allowed_account_id)
-                    st.session_state.location_id = location_id_input
-                    st.session_state.location_name = location.get("name", "Unknown")
-                    st.session_state.location_confirmed = False
-                    st.session_state.backup_bytes = None
-                    st.session_state.backup_filename = None
-                    st.session_state.backup_downloaded = False
-            except AccountGuardrailError as error:
-                st.error(str(error))
-            except Exception as error:
-                st.error(str(error))
+                    st.success("Location confirmed.")
+                    wizard_nav_row(
+                        primary_label="Continue to backup",
+                        primary_key="qm_continue_backup",
+                        primary_step=2,
+                        kind="quest_migrate",
+                    )
+        return
 
-        if st.session_state.location_id and st.session_state.location_name:
-            location_card(st.session_state.location_name, st.session_state.location_id)
-
-            if not st.session_state.location_confirmed:
-                confirm_col, cancel_col = st.columns(2)
-                with confirm_col:
-                    if st.button("Yes, this is the right location", type="primary", use_container_width=True):
-                        st.session_state.location_confirmed = True
-                        track_event("location_confirmed", action="migrate")
-                        st.rerun()
-                with cancel_col:
-                    if st.button("No, choose another", use_container_width=True):
-                        reset_from_location_change()
-                        st.session_state.location_id_input = ""
-                        st.rerun()
-            else:
-                st.success("Location confirmed.")
-
-    if st.session_state.location_confirmed:
+    if step == 2:
         with st.container(border=True):
             step_heading("Download backup", "2")
+            st.caption(
+                f"Location: **{st.session_state.location_name}** "
+                f"(`{st.session_state.location_id}`)"
+            )
             st.caption("Create and download a zip backup before running the migration.")
 
             if st.button("Create backup zip", use_container_width=True):
@@ -133,26 +183,52 @@ def migrate_page(allowed_account_id: str):
                     value=st.session_state.backup_downloaded,
                 )
 
-    if st.session_state.location_confirmed and st.session_state.backup_downloaded:
-        with st.container(border=True):
-            step_heading("Run migration", "3")
-            st.caption("Updates Wolt channels to retail, routes food channels to Quest, and tags the location.")
+            wizard_nav_row(
+                back_step=1,
+                back_key="qm_back_confirm",
+                primary_label="Continue to run",
+                primary_key="qm_continue_run",
+                primary_disabled=not st.session_state.backup_downloaded,
+                primary_step=3,
+                kind="quest_migrate",
+            )
+        return
 
-            if st.button("Run migration", type="primary", use_container_width=True):
-                try:
-                    with st.spinner("Running migration..."):
-                        results = run_migration(st.session_state.location_id, allowed_account_id)
-                    track_event(
-                        "migration_run",
-                        action="migrate",
-                        success=all(result.get("ok", True) for result in results if result.get("type") != "warning"),
-                    )
-                    show_results(results)
-                except AccountGuardrailError as error:
-                    st.error(str(error))
-                except Exception as error:
-                    st.error(str(error))
+    with st.container(border=True):
+        step_heading("Run migration", "3")
+        st.caption(
+            f"Location: **{st.session_state.location_name}** "
+            f"(`{st.session_state.location_id}`)"
+        )
+        st.warning("This is the live migration. Location and channel settings will be updated.")
+        st.caption(
+            "Updates Wolt channels to retail, routes food channels to Quest, and tags the location."
+        )
 
+        if st.button("Run migration", type="primary", use_container_width=True):
+            try:
+                with st.spinner("Running migration..."):
+                    results = run_migration(st.session_state.location_id, allowed_account_id)
+                track_event(
+                    "migration_run",
+                    action="migrate",
+                    success=all(
+                        result.get("ok", True)
+                        for result in results
+                        if result.get("type") != "warning"
+                    ),
+                )
+                show_results(results)
+            except AccountGuardrailError as error:
+                st.error(str(error))
+            except Exception as error:
+                st.error(str(error))
+
+        wizard_nav_row(
+            back_step=2,
+            back_key="qm_back_backup",
+            kind="quest_migrate",
+        )
 
 def revert_page(allowed_account_id: str):
     with st.container(border=True):
@@ -238,13 +314,342 @@ def _run_account_move_with_progress(
     return results
 
 
-def _account_move_per_location(
-    original_account_id: str,
-    destination_account_id: str,
-    role_group_id: str,
-):
+def _account_move_context_caption():
+    role_label = st.session_state.am_role_name or st.session_state.am_role_group_id
+    mode_label = (
+        "Per location"
+        if st.session_state.am_mode == "per_location"
+        else "Rest of account"
+    )
+    resolution = st.session_state.get("am_role_resolution") or {}
+    action = resolution.get("action")
+    role_note = {
+        "created": "created",
+        "matched": "matched",
+        "template": "template",
+        "selected": "selected",
+    }.get(action, "selected")
+    st.caption(
+        f"`{st.session_state.am_old_account_id}` → `{st.session_state.am_new_account_id}` · "
+        f"{mode_label} · role **{role_label}** ({role_note})"
+    )
+
+
+def _account_move_with_role_result(results: list[dict]) -> list[dict]:
+    """Prepend destination-role matched/created info to move results."""
+    role_row = role_resolution_result(
+        st.session_state.get("am_role_resolution"),
+        fallback_role_id=st.session_state.get("am_role_group_id"),
+        fallback_role_name=st.session_state.get("am_role_name"),
+    )
+    return [role_row, *results]
+
+
+def _account_move_step_accounts():
+    with st.container(border=True):
+        step_heading("Accounts", "1")
+        st.caption(
+            "Enter the old/new Deliverect account IDs, then pick a destination role "
+            "for Quest users (exactly one linked location). If the right role is missing, "
+            "recreate it once from the old account — same name is reused, never duplicated."
+        )
+
+        old_col, new_col = st.columns(2)
+        with old_col:
+            old_account_id = st.text_input(
+                "Old account ID",
+                value=st.session_state.am_old_account_id,
+                placeholder="69774c7c157f655400e9011b",
+                key="am_old_account_input",
+            )
+        with new_col:
+            new_account_id = st.text_input(
+                "New account ID",
+                value=st.session_state.am_new_account_id,
+                placeholder="69775643204154fab7012d5f",
+                key="am_new_account_input",
+            )
+
+        if (
+            old_account_id.strip() != st.session_state.am_old_account_id
+            or new_account_id.strip() != st.session_state.am_new_account_id
+        ):
+            st.session_state.am_old_account_id = old_account_id.strip()
+            st.session_state.am_new_account_id = new_account_id.strip()
+            reset_account_move_from_accounts_change()
+
+        accounts_match_ok = bool(
+            st.session_state.am_old_account_id and st.session_state.am_new_account_id
+        )
+        if (
+            accounts_match_ok
+            and st.session_state.am_old_account_id == st.session_state.am_new_account_id
+        ):
+            st.error("Old and new account IDs must be different.")
+            accounts_match_ok = False
+
+        if accounts_match_ok:
+            if (
+                st.session_state.am_roles is None
+                or st.session_state.am_roles_account_id != st.session_state.am_new_account_id
+            ):
+                try:
+                    with st.spinner("Loading destination roles…"):
+                        roles = list_all_roles(st.session_state.am_new_account_id)
+                    roles = sorted(
+                        roles,
+                        key=lambda role: (role.get("name") or role.get("_id") or "").lower(),
+                    )
+                    st.session_state.am_roles = roles
+                    st.session_state.am_roles_account_id = st.session_state.am_new_account_id
+                    if st.session_state.am_role_group_id and not any(
+                        role.get("_id") == st.session_state.am_role_group_id for role in roles
+                    ):
+                        st.session_state.am_role_group_id = ""
+                        st.session_state.am_role_name = None
+                except Exception as error:
+                    st.session_state.am_roles = []
+                    st.session_state.am_roles_account_id = st.session_state.am_new_account_id
+                    st.error(f"Could not load destination roles: {error}")
+
+            if (
+                st.session_state.am_source_roles is None
+                or st.session_state.am_source_roles_account_id
+                != st.session_state.am_old_account_id
+            ):
+                try:
+                    with st.spinner("Loading old-account roles…"):
+                        source_roles = list_all_roles(st.session_state.am_old_account_id)
+                    source_roles = sorted(
+                        source_roles,
+                        key=lambda role: (role.get("name") or role.get("_id") or "").lower(),
+                    )
+                    st.session_state.am_source_roles = source_roles
+                    st.session_state.am_source_roles_account_id = (
+                        st.session_state.am_old_account_id
+                    )
+                except Exception as error:
+                    st.session_state.am_source_roles = []
+                    st.session_state.am_source_roles_account_id = (
+                        st.session_state.am_old_account_id
+                    )
+                    st.error(f"Could not load old-account roles: {error}")
+
+            roles = st.session_state.am_roles or []
+            if not roles:
+                st.warning(
+                    "No roles found on the destination account. "
+                    "Recreate one from the old account below, then select it."
+                )
+                role_ids = []
+                role_labels = {}
+            else:
+                role_ids = [role.get("_id") for role in roles if role.get("_id")]
+                role_labels = {
+                    role.get("_id"): role.get("name") or role.get("_id")
+                    for role in roles
+                    if role.get("_id")
+                }
+
+            if role_ids:
+                current_role = st.session_state.am_role_group_id
+                if current_role not in role_ids:
+                    current_role = role_ids[0]
+                selected_id = st.selectbox(
+                    "Destination role",
+                    options=role_ids,
+                    index=role_ids.index(current_role),
+                    format_func=lambda role_id: f"{role_labels.get(role_id, role_id)} ({role_id})",
+                    key="am_role_select",
+                    help="Quest users will be assigned this role on the destination account.",
+                )
+                previous_resolution = st.session_state.get("am_role_resolution") or {}
+                st.session_state.am_role_group_id = selected_id
+                st.session_state.am_role_name = role_labels.get(selected_id, selected_id)
+                # Manual pick (or changed after recreate) counts as selected existing.
+                if previous_resolution.get("destination_role_id") != selected_id:
+                    st.session_state.am_role_resolution = {
+                        "action": "selected",
+                        "destination_role_id": selected_id,
+                        "role_name": st.session_state.am_role_name,
+                        "source_role_id": None,
+                        "source_role_name": None,
+                    }
+                resolution = st.session_state.get("am_role_resolution") or {}
+                if resolution.get("action") == "created":
+                    st.success(
+                        f"Role will be used as **created**: "
+                        f"{st.session_state.am_role_name}"
+                    )
+                elif resolution.get("action") == "matched":
+                    st.info(
+                        f"Role will be used as **matched** (already on destination): "
+                        f"{st.session_state.am_role_name}"
+                    )
+            else:
+                st.session_state.am_role_group_id = ""
+                st.session_state.am_role_name = None
+
+            source_roles = st.session_state.am_source_roles or []
+            recreateable = [
+                role
+                for role in source_roles
+                if role.get("_id") and (role.get("name") or role.get("template"))
+            ]
+            with st.expander("Role missing? Recreate from old account", expanded=not role_ids):
+                st.caption(
+                    "Pick a role from the old account. If the destination already has the "
+                    "same name, we select that one — we never create a second copy."
+                )
+                if not recreateable:
+                    st.info("No roles found on the old account to recreate.")
+                else:
+                    source_ids = [role.get("_id") for role in recreateable]
+                    source_labels = {
+                        role.get("_id"): (
+                            f"{role.get('name') or role.get('_id')}"
+                            + (" (template)" if role.get("template") else "")
+                        )
+                        for role in recreateable
+                    }
+                    source_by_id = {role.get("_id"): role for role in recreateable}
+                    recreate_source_id = st.selectbox(
+                        "Old-account role to recreate",
+                        options=source_ids,
+                        format_func=lambda role_id: (
+                            f"{source_labels.get(role_id, role_id)} ({role_id})"
+                        ),
+                        key="am_recreate_source_role",
+                    )
+                    if st.button(
+                        "Recreate / reuse on destination",
+                        use_container_width=True,
+                        key="am_recreate_role_btn",
+                    ):
+                        try:
+                            source_role = source_by_id.get(recreate_source_id)
+                            with st.spinner("Ensuring destination role…"):
+                                dest_role, action = ensure_destination_role_from_source(
+                                    source_role,
+                                    st.session_state.am_new_account_id,
+                                    destination_roles=st.session_state.am_roles or [],
+                                )
+                            refreshed = list_all_roles(st.session_state.am_new_account_id)
+                            refreshed = sorted(
+                                refreshed,
+                                key=lambda role: (
+                                    role.get("name") or role.get("_id") or ""
+                                ).lower(),
+                            )
+                            if dest_role.get("_id") and not any(
+                                role.get("_id") == dest_role.get("_id") for role in refreshed
+                            ):
+                                refreshed = [dest_role] + refreshed
+                            st.session_state.am_roles = refreshed
+                            st.session_state.am_roles_account_id = (
+                                st.session_state.am_new_account_id
+                            )
+                            st.session_state.am_role_group_id = dest_role.get("_id")
+                            st.session_state.am_role_name = (
+                                dest_role.get("name") or dest_role.get("_id")
+                            )
+                            st.session_state.am_role_resolution = {
+                                "action": action,
+                                "destination_role_id": dest_role.get("_id"),
+                                "role_name": st.session_state.am_role_name,
+                                "source_role_id": recreate_source_id,
+                                "source_role_name": source_role.get("name")
+                                if source_role
+                                else None,
+                            }
+                            track_event(
+                                "account_move_role_recreated",
+                                action="account_move",
+                                role_action=action,
+                                source_role_id=recreate_source_id,
+                                destination_role_id=dest_role.get("_id"),
+                                role_name=st.session_state.am_role_name,
+                            )
+                            if action == "created":
+                                st.success(
+                                    f"**Created** destination role "
+                                    f"**{st.session_state.am_role_name}** and selected it."
+                                )
+                            elif action == "matched":
+                                st.info(
+                                    f"**Matched** existing destination role "
+                                    f"**{st.session_state.am_role_name}** — not recreated."
+                                )
+                            else:
+                                st.info(
+                                    f"**Template** role **{st.session_state.am_role_name}** "
+                                    "(global — not recreated)."
+                                )
+                            st.rerun()
+                        except AccountMoveGuardrailError as error:
+                            st.error(str(error))
+                        except Exception as error:
+                            st.error(f"Could not recreate role: {error}")
+
+        accounts_ready = bool(accounts_match_ok and st.session_state.am_role_group_id)
+        if accounts_match_ok and not st.session_state.am_role_group_id:
+            st.caption("Select a destination role (or recreate one) to continue.")
+
+        if st.button(
+            "Continue to mode",
+            type="primary",
+            disabled=not accounts_ready,
+            use_container_width=True,
+            key="am_confirm_accounts",
+        ):
+            st.session_state.am_accounts_confirmed = True
+            set_account_move_step(2)
+            track_event(
+                "account_move_accounts_confirmed",
+                action="account_move",
+                old_account_id=st.session_state.am_old_account_id,
+                new_account_id=st.session_state.am_new_account_id,
+                role_group_id=st.session_state.am_role_group_id,
+                role_name=st.session_state.am_role_name,
+            )
+            st.rerun()
+
+
+def _account_move_step_mode():
+    with st.container(border=True):
+        step_heading("Mode", "2")
+        _account_move_context_caption()
+        mode = st.radio(
+            "How do you want to move?",
+            options=["per_location", "rest_of_account"],
+            format_func=lambda value: (
+                "Per location" if value == "per_location" else "Rest of account"
+            ),
+            horizontal=True,
+            key="am_mode_radio",
+        )
+        if mode != st.session_state.am_mode:
+            previous = st.session_state.am_mode
+            st.session_state.am_mode = mode
+            if mode == "per_location" and previous == "rest_of_account":
+                reset_account_move_rest()
+            elif mode == "rest_of_account" and previous == "per_location":
+                reset_account_move_per_location()
+            st.rerun()
+
+        wizard_nav_row(
+            back_step=1,
+            back_key="am_back_accounts",
+            primary_label="Continue to confirm",
+            primary_key="am_continue_confirm",
+            primary_step=3,
+        )
+
+
+def _account_move_per_location_confirm(original_account_id: str, destination_account_id: str):
     with st.container(border=True):
         step_heading("Confirm original location", "3")
+        _account_move_context_caption()
         location_id_input = st.text_input(
             "Original location ID",
             value=st.session_state.am_location_id_input,
@@ -302,6 +707,7 @@ def _account_move_per_location(
             except Exception as error:
                 st.error(str(error))
 
+        can_continue = False
         if st.session_state.am_location_id:
             location_card(st.session_state.am_location_name, st.session_state.am_location_id)
             retained = st.session_state.get("am_retained_count") or 0
@@ -327,12 +733,8 @@ def _account_move_per_location(
                     marker_note = " Name already contains a `#MIGRATED…#` marker."
                 elif st.session_state.get("am_retained_count"):
                     marker_note = " Only Test Channel remains (left in place)."
-                st.warning(
-                    "This location has nothing to move." + marker_note
-                )
-                return
-
-            if not st.session_state.am_confirmed:
+                st.warning("This location has nothing to move." + marker_note)
+            elif not st.session_state.am_confirmed:
                 confirm_col, cancel_col = st.columns(2)
                 with confirm_col:
                     if st.button(
@@ -348,6 +750,7 @@ def _account_move_per_location(
                             mode="per_location",
                             location_id=st.session_state.am_location_id,
                         )
+                        set_account_move_step(4)
                         st.rerun()
                 with cancel_col:
                     if st.button("No, choose another", use_container_width=True, key="am_cancel"):
@@ -356,12 +759,131 @@ def _account_move_per_location(
                         st.rerun()
             else:
                 st.success("Move confirmed.")
+                can_continue = True
 
-    if st.session_state.am_confirmed and st.session_state.am_snapshot:
-        with st.container(border=True):
-            step_heading("Download backup", "4")
+        wizard_nav_row(
+            back_step=2,
+            back_key="am_back_mode_per",
+            primary_label="Continue to backup",
+            primary_key="am_continue_backup_per",
+            primary_disabled=not can_continue,
+            primary_step=4,
+        )
+
+
+def _account_move_rest_confirm(original_account_id: str, destination_account_id: str):
+    with st.container(border=True):
+        step_heading("Load remaining locations", "3")
+        _account_move_context_caption()
+        st.caption(
+            "Loads both accounts, matches by exact location name, and migrates every original "
+            "location that still has channel links."
+        )
+
+        if st.button("Load account locations", use_container_width=True, key="am_rest_load"):
+            try:
+                with st.spinner("Loading locations..."):
+                    originals = list_all_locations(original_account_id)
+                    destinations = list_all_locations(destination_account_id)
+                    rows = classify_account_locations(
+                        originals,
+                        destinations,
+                        original_account_id,
+                    )
+                st.session_state.am_rest_rows = rows
+                st.session_state.am_rest_loaded = True
+                st.session_state.am_backup_bytes = None
+                st.session_state.am_backup_filename = None
+                st.session_state.am_backup_summary = None
+                st.session_state.am_backup_downloaded = False
+                st.session_state.am_rest_snapshots = None
+                track_event(
+                    "account_move_rest_loaded",
+                    action="account_move",
+                    mode="rest_of_account",
+                    ready=sum(1 for row in rows if row["status"] == "ready"),
+                    already_moved=sum(1 for row in rows if row["status"] == "already_moved"),
+                    unmatched=sum(1 for row in rows if row["status"] == "unmatched"),
+                )
+            except Exception as error:
+                st.error(str(error))
+
+        can_continue = False
+        if st.session_state.am_rest_loaded and st.session_state.am_rest_rows:
+            rows = st.session_state.am_rest_rows
+            ready = [row for row in rows if row["status"] == "ready"]
+            already_moved = [row for row in rows if row["status"] == "already_moved"]
+            unmatched = [row for row in rows if row["status"] == "unmatched"]
+
+            account_move_match_summary(len(ready), len(already_moved), len(unmatched))
+
+            if ready:
+                st.markdown("**Ready to move**")
+                st.dataframe(
+                    [
+                        {
+                            "Original": row["original"].get("name"),
+                            "Original ID": row["original"]["_id"],
+                            "Destination": row["destination"].get("name") if row["destination"] else "",
+                            "Destination ID": row["destination"]["_id"] if row["destination"] else "",
+                            "Match name": row["match_name"],
+                            "To move": len(row["channel_link_ids"]),
+                            "Quest users": len(row.get("users") or []),
+                            "Keep Test Channel": len(row.get("retained_channel_link_ids") or []),
+                        }
+                        for row in ready
+                    ],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                can_continue = True
+
+            if unmatched:
+                with st.expander(f"Unmatched ({len(unmatched)})"):
+                    for row in unmatched:
+                        st.write(
+                            f"- {row['original'].get('name')} (`{row['original']['_id']}`) "
+                            f"name `{row['match_name']}` — {len(row['channel_link_ids'])} to move"
+                        )
+
+            if already_moved:
+                with st.expander(f"Already moved / skipped ({len(already_moved)})"):
+                    for row in already_moved:
+                        retained = len(row.get("retained_channel_link_ids") or [])
+                        reason = (
+                            "only Test Channel left"
+                            if retained and not row["channel_link_ids"]
+                            else "already moved / nothing to move"
+                        )
+                        st.write(
+                            f"- {row['original'].get('name')} (`{row['original']['_id']}`) — {reason}"
+                        )
+
+            if not ready:
+                st.warning("No locations left to move.")
+
+        wizard_nav_row(
+            back_step=2,
+            back_key="am_back_mode_rest",
+            primary_label="Continue to backup",
+            primary_key="am_continue_backup_rest",
+            primary_disabled=not can_continue,
+            primary_step=4,
+        )
+
+
+def _account_move_backup_step(original_account_id: str, destination_account_id: str):
+    with st.container(border=True):
+        step_heading("Download backup", "4")
+        _account_move_context_caption()
+
+        if st.session_state.am_mode == "per_location":
+            if not st.session_state.am_confirmed or not st.session_state.am_snapshot:
+                st.warning("Confirm a location first.")
+                wizard_nav_row(back_step=3, back_key="am_back_confirm_from_backup_empty")
+                return
+
             st.caption("Create and download a zip backup before moving channel links.")
-
             if st.button("Create backup zip", use_container_width=True, key="am_create_backup"):
                 try:
                     backup_bytes, backup_filename, summary = create_account_move_backup_zip(
@@ -409,10 +931,126 @@ def _account_move_per_location(
                     value=st.session_state.am_backup_downloaded,
                     key="am_backup_checkbox",
                 )
+        else:
+            rows = st.session_state.am_rest_rows or []
+            ready = [row for row in rows if row["status"] == "ready"]
+            if not ready:
+                st.warning("Load ready locations first.")
+                wizard_nav_row(back_step=3, back_key="am_back_confirm_from_backup_rest_empty")
+                return
 
-    if st.session_state.am_confirmed and st.session_state.am_backup_downloaded:
-        with st.container(border=True):
-            step_heading("Run account move", "5")
+            st.caption(f"Backup covers all {len(ready)} ready location(s).")
+            if st.button("Create backup zip", use_container_width=True, key="am_rest_backup"):
+                try:
+                    with st.spinner("Building backup (fetching full location snapshots)..."):
+                        snapshots = []
+                        progress = st.progress(0.0, text="Preparing backup…")
+                        for index, row in enumerate(ready):
+                            progress.progress(
+                                (index) / max(len(ready), 1),
+                                text=f"Backing up {row['original'].get('name')}…",
+                            )
+                            original, original_status = get_location(row["original"]["_id"])
+                            if original_status != 200:
+                                raise RuntimeError(
+                                    f"Failed to refresh original location "
+                                    f"{row['original']['_id']}: HTTP {original_status}"
+                                )
+                            destination, destination_status = get_location(
+                                row["destination"]["_id"]
+                            )
+                            if destination_status != 200:
+                                raise RuntimeError(
+                                    f"Failed to refresh destination location "
+                                    f"{row['destination']['_id']}: HTTP {destination_status}"
+                                )
+                            snapshots.append(
+                                {
+                                    "original_location": original,
+                                    "destination_location": destination,
+                                    "channel_links": list(row.get("channel_links") or []),
+                                    "retained_channel_links": list(
+                                        row.get("retained_channel_links") or []
+                                    ),
+                                    "users": list(row.get("users") or []),
+                                    "match_name": row.get("match_name"),
+                                    "status": row.get("status"),
+                                }
+                            )
+                        backup_bytes, backup_filename, summary = create_account_move_backup_zip(
+                            snapshots,
+                            original_account_id,
+                            destination_account_id,
+                            mode="rest_of_account",
+                        )
+                        progress.progress(1.0, text="Backup zip ready")
+                    st.session_state.am_backup_bytes = backup_bytes
+                    st.session_state.am_backup_filename = backup_filename
+                    st.session_state.am_backup_summary = summary
+                    st.session_state.am_backup_downloaded = False
+                    st.session_state.am_rest_snapshots = snapshots
+                    track_event(
+                        "account_move_backup_created",
+                        action="account_move",
+                        mode="rest_of_account",
+                        filename=backup_filename,
+                        location_count=summary["location_count"],
+                        channel_link_count=summary["channel_link_count"],
+                    )
+                    st.success(
+                        f"Backup ready · {summary['location_count']} location(s) · "
+                        f"{summary['channel_link_count']} channel link(s) "
+                        f"({summary['movable_channel_link_count']} to move) · "
+                        f"{summary.get('user_count', 0)} Quest user(s)."
+                    )
+                except Exception as error:
+                    st.error(str(error))
+
+            if st.session_state.am_backup_bytes:
+                summary = st.session_state.get("am_backup_summary") or {}
+                st.caption(
+                    f"Zip includes **{summary.get('channel_link_count', '?')}** channel link(s) "
+                    f"across **{summary.get('location_count', '?')}** location(s) "
+                    f"· {summary.get('size_bytes', 0):,} bytes."
+                )
+                st.download_button(
+                    label="Download backup zip",
+                    data=bytes(st.session_state.am_backup_bytes),
+                    file_name=st.session_state.am_backup_filename,
+                    mime="application/zip",
+                    use_container_width=True,
+                    key="am_rest_download",
+                )
+                st.session_state.am_backup_downloaded = st.checkbox(
+                    "I have downloaded the backup zip",
+                    value=st.session_state.am_backup_downloaded,
+                    key="am_rest_checkbox",
+                )
+
+        wizard_nav_row(
+            back_step=3,
+            back_key="am_back_confirm_from_backup",
+            primary_label="Continue to run move",
+            primary_key="am_continue_run",
+            primary_disabled=not st.session_state.am_backup_downloaded,
+            primary_step=5,
+        )
+
+
+def _account_move_run_step(
+    original_account_id: str,
+    destination_account_id: str,
+    role_group_id: str,
+):
+    with st.container(border=True):
+        step_heading("Run account move", "5")
+        _account_move_context_caption()
+        st.warning(
+            "This is the live move. Channel links, location names, and Quest users "
+            "will be updated on Deliverect."
+        )
+
+        if st.session_state.am_mode == "per_location":
             st.caption(
                 "Moves channel links to the destination account/location, clears them on the "
                 "original, and appends `#MIGRATEDTO{destinationId}#` to the original name."
@@ -425,15 +1063,19 @@ def _account_move_per_location(
                         destination_account_id,
                         role_group_id,
                     )
+                    results = _account_move_with_role_result(results)
                     track_event(
                         "account_move_run",
                         action="account_move",
                         mode="per_location",
                         location_id=st.session_state.am_location_id,
+                        role_action=(
+                            (st.session_state.get("am_role_resolution") or {}).get("action")
+                        ),
                         success=all(
                             result.get("ok", True)
                             for result in results
-                            if result.get("type") != "warning"
+                            if result.get("type") not in ("warning", "role")
                         ),
                     )
                     show_account_move_results(results)
@@ -441,197 +1083,9 @@ def _account_move_per_location(
                     st.error(str(error))
                 except Exception as error:
                     st.error(str(error))
-
-
-def _account_move_rest_of_account(
-    original_account_id: str,
-    destination_account_id: str,
-    role_group_id: str,
-):
-    with st.container(border=True):
-        step_heading("Load remaining locations", "3")
-        st.caption(
-            "Loads both accounts, matches by exact location name, and migrates every original "
-            "location that still has channel links."
-        )
-
-        if st.button("Load account locations", use_container_width=True, key="am_rest_load"):
-            try:
-                with st.spinner("Loading locations..."):
-                    originals = list_all_locations(original_account_id)
-                    destinations = list_all_locations(destination_account_id)
-                    rows = classify_account_locations(
-                        originals,
-                        destinations,
-                        original_account_id,
-                    )
-                st.session_state.am_rest_rows = rows
-                st.session_state.am_rest_loaded = True
-                st.session_state.am_backup_bytes = None
-                st.session_state.am_backup_filename = None
-                st.session_state.am_backup_summary = None
-                st.session_state.am_backup_downloaded = False
-                track_event(
-                    "account_move_rest_loaded",
-                    action="account_move",
-                    mode="rest_of_account",
-                    ready=sum(1 for row in rows if row["status"] == "ready"),
-                    already_moved=sum(1 for row in rows if row["status"] == "already_moved"),
-                    unmatched=sum(1 for row in rows if row["status"] == "unmatched"),
-                )
-            except Exception as error:
-                st.error(str(error))
-
-        if not st.session_state.am_rest_loaded or not st.session_state.am_rest_rows:
-            return
-
-        rows = st.session_state.am_rest_rows
-        ready = [row for row in rows if row["status"] == "ready"]
-        already_moved = [row for row in rows if row["status"] == "already_moved"]
-        unmatched = [row for row in rows if row["status"] == "unmatched"]
-
-        account_move_match_summary(len(ready), len(already_moved), len(unmatched))
-
-        if ready:
-            st.markdown("**Ready to move**")
-            st.dataframe(
-                [
-                    {
-                        "Original": row["original"].get("name"),
-                        "Original ID": row["original"]["_id"],
-                        "Destination": row["destination"].get("name") if row["destination"] else "",
-                        "Destination ID": row["destination"]["_id"] if row["destination"] else "",
-                        "Match name": row["match_name"],
-                        "To move": len(row["channel_link_ids"]),
-                        "Quest users": len(row.get("users") or []),
-                        "Keep Test Channel": len(row.get("retained_channel_link_ids") or []),
-                    }
-                    for row in ready
-                ],
-                use_container_width=True,
-                hide_index=True,
-            )
-
-        if unmatched:
-            with st.expander(f"Unmatched ({len(unmatched)})"):
-                for row in unmatched:
-                    st.write(
-                        f"- {row['original'].get('name')} (`{row['original']['_id']}`) "
-                        f"name `{row['match_name']}` — {len(row['channel_link_ids'])} to move"
-                    )
-
-        if already_moved:
-            with st.expander(f"Already moved / skipped ({len(already_moved)})"):
-                for row in already_moved:
-                    retained = len(row.get("retained_channel_link_ids") or [])
-                    reason = (
-                        "only Test Channel left"
-                        if retained and not row["channel_link_ids"]
-                        else "already moved / nothing to move"
-                    )
-                    st.write(
-                        f"- {row['original'].get('name')} (`{row['original']['_id']}`) — {reason}"
-                    )
-
-        if not ready:
-            st.warning("No locations left to move.")
-            return
-
-    with st.container(border=True):
-        step_heading("Download backup", "4")
-        st.caption(f"Backup covers all {len(ready)} ready location(s).")
-
-        if st.button("Create backup zip", use_container_width=True, key="am_rest_backup"):
-            try:
-                with st.spinner("Building backup (fetching full location snapshots)..."):
-                    snapshots = []
-                    progress = st.progress(0.0, text="Preparing backup…")
-                    for index, row in enumerate(ready):
-                        progress.progress(
-                            (index) / max(len(ready), 1),
-                            text=f"Backing up {row['original'].get('name')}…",
-                        )
-                        # Refresh location docs, reuse already-fetched channel links.
-                        original, original_status = get_location(row["original"]["_id"])
-                        if original_status != 200:
-                            raise RuntimeError(
-                                f"Failed to refresh original location "
-                                f"{row['original']['_id']}: HTTP {original_status}"
-                            )
-                        destination, destination_status = get_location(
-                            row["destination"]["_id"]
-                        )
-                        if destination_status != 200:
-                            raise RuntimeError(
-                                f"Failed to refresh destination location "
-                                f"{row['destination']['_id']}: HTTP {destination_status}"
-                            )
-                        snapshots.append(
-                            {
-                                "original_location": original,
-                                "destination_location": destination,
-                                "channel_links": list(row.get("channel_links") or []),
-                                "retained_channel_links": list(
-                                    row.get("retained_channel_links") or []
-                                ),
-                                "users": list(row.get("users") or []),
-                                "match_name": row.get("match_name"),
-                                "status": row.get("status"),
-                            }
-                        )
-                    backup_bytes, backup_filename, summary = create_account_move_backup_zip(
-                        snapshots,
-                        original_account_id,
-                        destination_account_id,
-                        mode="rest_of_account",
-                    )
-                    progress.progress(1.0, text="Backup zip ready")
-                st.session_state.am_backup_bytes = backup_bytes
-                st.session_state.am_backup_filename = backup_filename
-                st.session_state.am_backup_summary = summary
-                st.session_state.am_backup_downloaded = False
-                st.session_state.am_rest_snapshots = snapshots
-                track_event(
-                    "account_move_backup_created",
-                    action="account_move",
-                    mode="rest_of_account",
-                    filename=backup_filename,
-                    location_count=summary["location_count"],
-                    channel_link_count=summary["channel_link_count"],
-                )
-                st.success(
-                    f"Backup ready · {summary['location_count']} location(s) · "
-                    f"{summary['channel_link_count']} channel link(s) "
-                    f"({summary['movable_channel_link_count']} to move) · "
-                    f"{summary.get('user_count', 0)} Quest user(s)."
-                )
-            except Exception as error:
-                st.error(str(error))
-
-        if st.session_state.am_backup_bytes:
-            summary = st.session_state.get("am_backup_summary") or {}
-            st.caption(
-                f"Zip includes **{summary.get('channel_link_count', '?')}** channel link(s) "
-                f"across **{summary.get('location_count', '?')}** location(s) "
-                f"· {summary.get('size_bytes', 0):,} bytes."
-            )
-            st.download_button(
-                label="Download backup zip",
-                data=bytes(st.session_state.am_backup_bytes),
-                file_name=st.session_state.am_backup_filename,
-                mime="application/zip",
-                use_container_width=True,
-                key="am_rest_download",
-            )
-            st.session_state.am_backup_downloaded = st.checkbox(
-                "I have downloaded the backup zip",
-                value=st.session_state.am_backup_downloaded,
-                key="am_rest_checkbox",
-            )
-
-    if st.session_state.am_backup_downloaded:
-        with st.container(border=True):
-            step_heading("Run account move", "5")
+        else:
+            rows = st.session_state.am_rest_rows or []
+            ready = [row for row in rows if row["status"] == "ready"]
             st.caption(f"Moves channel links for {len(ready)} location(s).")
             if st.button(
                 "Run account move for ready locations",
@@ -647,194 +1101,85 @@ def _account_move_rest_of_account(
                         destination_account_id,
                         role_group_id,
                     )
+                    results = _account_move_with_role_result(results)
                     track_event(
                         "account_move_run",
                         action="account_move",
                         mode="rest_of_account",
                         location_count=len(location_ids),
+                        role_action=(
+                            (st.session_state.get("am_role_resolution") or {}).get("action")
+                        ),
                         success=all(
                             result.get("ok", True)
                             for result in results
-                            if result.get("type") != "warning"
+                            if result.get("type") not in ("warning", "role")
                         ),
                     )
                     show_account_move_results(results)
-                    # Force reload classification next time
                     st.session_state.am_rest_loaded = False
                 except AccountMoveGuardrailError as error:
                     st.error(str(error))
                 except Exception as error:
                     st.error(str(error))
 
+        wizard_nav_row(back_step=4, back_key="am_back_backup_from_run")
+
 
 def account_move_page():
-    with st.container(border=True):
-        step_heading("Accounts", "1")
-        st.caption(
-            "Enter the old/new Deliverect account IDs, then pick a destination role "
-            "for Quest users (exactly one linked location)."
-        )
+    step = account_move_current_step()
 
-        old_col, new_col = st.columns(2)
-        with old_col:
-            old_account_id = st.text_input(
-                "Old account ID",
-                value=st.session_state.am_old_account_id,
-                placeholder="69774c7c157f655400e9011b",
-                key="am_old_account_input",
+    # Clamp the viewed step to what the session has unlocked.
+    if step >= 2 and not st.session_state.am_accounts_confirmed:
+        set_account_move_step(1)
+        step = 1
+    elif step >= 4:
+        if st.session_state.am_mode == "per_location" and not st.session_state.am_confirmed:
+            set_account_move_step(3)
+            step = 3
+        elif st.session_state.am_mode == "rest_of_account" and not (
+            st.session_state.am_rest_loaded
+            and any(
+                row.get("status") == "ready"
+                for row in (st.session_state.am_rest_rows or [])
             )
-        with new_col:
-            new_account_id = st.text_input(
-                "New account ID",
-                value=st.session_state.am_new_account_id,
-                placeholder="69775643204154fab7012d5f",
-                key="am_new_account_input",
-            )
-
-        if (
-            old_account_id.strip() != st.session_state.am_old_account_id
-            or new_account_id.strip() != st.session_state.am_new_account_id
         ):
-            st.session_state.am_old_account_id = old_account_id.strip()
-            st.session_state.am_new_account_id = new_account_id.strip()
-            reset_account_move_from_accounts_change()
+            set_account_move_step(3)
+            step = 3
+    if step >= 5 and not st.session_state.am_backup_downloaded:
+        set_account_move_step(4)
+        step = 4
 
-        accounts_match_ok = bool(
-            st.session_state.am_old_account_id and st.session_state.am_new_account_id
-        )
-        if (
-            accounts_match_ok
-            and st.session_state.am_old_account_id == st.session_state.am_new_account_id
-        ):
-            st.error("Old and new account IDs must be different.")
-            accounts_match_ok = False
+    wizard_steps(
+        ACCOUNT_MOVE_WIZARD_STEPS,
+        step,
+        note="Only <strong>Run move</strong> changes live data. Use Back to revisit earlier steps.",
+    )
 
-        # Load destination roles once the new account ID is set.
-        if accounts_match_ok:
-            if (
-                st.session_state.am_roles is None
-                or st.session_state.am_roles_account_id != st.session_state.am_new_account_id
-            ):
-                try:
-                    with st.spinner("Loading destination roles…"):
-                        roles = list_all_roles(st.session_state.am_new_account_id)
-                    # Prefer a readable name field; fall back to _id.
-                    roles = sorted(
-                        roles,
-                        key=lambda role: (role.get("name") or role.get("_id") or "").lower(),
-                    )
-                    st.session_state.am_roles = roles
-                    st.session_state.am_roles_account_id = st.session_state.am_new_account_id
-                    # Clear previous selection if roles were reloaded for a new account.
-                    if st.session_state.am_role_group_id and not any(
-                        role.get("_id") == st.session_state.am_role_group_id for role in roles
-                    ):
-                        st.session_state.am_role_group_id = ""
-                        st.session_state.am_role_name = None
-                except Exception as error:
-                    st.session_state.am_roles = []
-                    st.session_state.am_roles_account_id = st.session_state.am_new_account_id
-                    st.error(f"Could not load roles: {error}")
+    if step == 1:
+        _account_move_step_accounts()
+        return
 
-            roles = st.session_state.am_roles or []
-            if not roles:
-                st.warning("No roles found on the destination account.")
-                role_ids = []
-                role_labels = {}
-            else:
-                role_ids = [role.get("_id") for role in roles if role.get("_id")]
-                role_labels = {
-                    role.get("_id"): role.get("name") or role.get("_id")
-                    for role in roles
-                    if role.get("_id")
-                }
-
-            if role_ids:
-                current_role = st.session_state.am_role_group_id
-                if current_role not in role_ids:
-                    current_role = role_ids[0]
-                selected_id = st.selectbox(
-                    "Destination role",
-                    options=role_ids,
-                    index=role_ids.index(current_role),
-                    format_func=lambda role_id: f"{role_labels.get(role_id, role_id)} ({role_id})",
-                    key="am_role_select",
-                    help="Quest users will be assigned this role on the destination account.",
-                )
-                st.session_state.am_role_group_id = selected_id
-                st.session_state.am_role_name = role_labels.get(selected_id, selected_id)
-            else:
-                st.session_state.am_role_group_id = ""
-                st.session_state.am_role_name = None
-
-        accounts_ready = bool(
-            accounts_match_ok and st.session_state.am_role_group_id
-        )
-        if accounts_match_ok and not st.session_state.am_role_group_id:
-            st.caption("Select a destination role to continue.")
-
-        if not st.session_state.am_accounts_confirmed:
-            if st.button(
-                "Use these accounts",
-                type="primary",
-                disabled=not accounts_ready,
-                use_container_width=True,
-                key="am_confirm_accounts",
-            ):
-                st.session_state.am_accounts_confirmed = True
-                track_event(
-                    "account_move_accounts_confirmed",
-                    action="account_move",
-                    old_account_id=st.session_state.am_old_account_id,
-                    new_account_id=st.session_state.am_new_account_id,
-                    role_group_id=st.session_state.am_role_group_id,
-                    role_name=st.session_state.am_role_name,
-                )
-                st.rerun()
-            return
-
-        role_label = st.session_state.am_role_name or st.session_state.am_role_group_id
-        st.success(
-            f"Moving from `{st.session_state.am_old_account_id}` → "
-            f"`{st.session_state.am_new_account_id}` · "
-            f"role **{role_label}** (`{st.session_state.am_role_group_id}`)"
-        )
-        if st.button("Change accounts", use_container_width=True, key="am_change_accounts"):
-            reset_account_move_from_accounts_change()
-            st.rerun()
+    if step == 2:
+        _account_move_step_mode()
+        return
 
     original_account_id = st.session_state.am_old_account_id
     destination_account_id = st.session_state.am_new_account_id
     role_group_id = st.session_state.am_role_group_id
 
-    with st.container(border=True):
-        step_heading("Mode", "2")
-        mode = st.radio(
-            "How do you want to move?",
-            options=["per_location", "rest_of_account"],
-            format_func=lambda value: (
-                "Per location" if value == "per_location" else "Rest of account"
-            ),
-            horizontal=True,
-            key="am_mode_radio",
-        )
-        if mode != st.session_state.am_mode:
-            previous = st.session_state.am_mode
-            st.session_state.am_mode = mode
-            if mode == "per_location" and previous == "rest_of_account":
-                reset_account_move_rest()
-            elif mode == "rest_of_account" and previous == "per_location":
-                reset_account_move_per_location()
-            st.rerun()
+    if step == 3:
+        if st.session_state.am_mode == "per_location":
+            _account_move_per_location_confirm(original_account_id, destination_account_id)
+        else:
+            _account_move_rest_confirm(original_account_id, destination_account_id)
+        return
 
-    if st.session_state.am_mode == "per_location":
-        _account_move_per_location(
-            original_account_id, destination_account_id, role_group_id
-        )
-    else:
-        _account_move_rest_of_account(
-            original_account_id, destination_account_id, role_group_id
-        )
+    if step == 4:
+        _account_move_backup_step(original_account_id, destination_account_id)
+        return
+
+    _account_move_run_step(original_account_id, destination_account_id, role_group_id)
 
 
 def account_revert_page():

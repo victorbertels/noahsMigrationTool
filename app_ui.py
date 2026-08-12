@@ -46,6 +46,111 @@ def apply_styles():
                 border-radius: 999px;
                 margin-bottom: 0.35rem;
             }
+            .wizard-rail {
+                background: #f7f8fc;
+                border: 1px solid #e2e6f3;
+                border-radius: 12px;
+                padding: 0.9rem 1rem 1rem 1rem;
+                margin: 0 0 1.1rem 0;
+            }
+            .wizard-rail-note {
+                font-size: 0.82rem;
+                color: #6b7280;
+                margin: 0 0 0.65rem 0;
+            }
+            .wizard-rail-note strong {
+                color: #b45309;
+            }
+            .wizard-steps {
+                display: flex;
+                flex-wrap: wrap;
+                align-items: flex-start;
+                gap: 0.35rem 0;
+                list-style: none;
+                margin: 0;
+                padding: 0;
+            }
+            .wizard-step {
+                display: flex;
+                align-items: center;
+                gap: 0.4rem;
+                min-width: 0;
+            }
+            .wizard-step + .wizard-step::before {
+                content: "";
+                width: 1.1rem;
+                height: 2px;
+                background: #d1d5db;
+                margin: 0 0.35rem 0 0.15rem;
+                flex-shrink: 0;
+            }
+            .wizard-bullet {
+                width: 1.35rem;
+                height: 1.35rem;
+                border-radius: 999px;
+                border: 2px solid #c5cbe3;
+                background: #ffffff;
+                color: #6b7280;
+                font-size: 0.72rem;
+                font-weight: 700;
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                flex-shrink: 0;
+            }
+            .wizard-label {
+                font-size: 0.82rem;
+                font-weight: 600;
+                color: #6b7280;
+                white-space: nowrap;
+            }
+            .wizard-tag {
+                font-size: 0.65rem;
+                font-weight: 700;
+                letter-spacing: 0.04em;
+                text-transform: uppercase;
+                color: #b45309;
+                background: #fff7ed;
+                border: 1px solid #fed7aa;
+                border-radius: 999px;
+                padding: 0.1rem 0.4rem;
+                margin-left: 0.15rem;
+            }
+            .wizard-step.done .wizard-bullet {
+                background: #ecfdf5;
+                border-color: #34d399;
+                color: #047857;
+            }
+            .wizard-step.done .wizard-label {
+                color: #047857;
+            }
+            .wizard-step.done + .wizard-step::before {
+                background: #6ee7b7;
+            }
+            .wizard-step.active .wizard-bullet {
+                background: #3d4f9f;
+                border-color: #3d4f9f;
+                color: #ffffff;
+            }
+            .wizard-step.active .wizard-label {
+                color: #1a1f36;
+            }
+            .wizard-step.move .wizard-bullet {
+                border-color: #f59e0b;
+            }
+            .wizard-step.move.active .wizard-bullet {
+                background: #b45309;
+                border-color: #b45309;
+                color: #ffffff;
+            }
+            .wizard-step.move.active .wizard-label {
+                color: #92400e;
+            }
+            .wizard-step.move.done .wizard-bullet {
+                background: #fff7ed;
+                border-color: #f59e0b;
+                color: #b45309;
+            }
             .location-card {
                 background: #f7f8fc;
                 border: 1px solid #e2e6f3;
@@ -205,6 +310,141 @@ def step_heading(title: str, step: str = None):
     if step:
         st.markdown(f'<span class="step-label">Step {step}</span>', unsafe_allow_html=True)
     st.markdown(f"#### {title}")
+
+
+def wizard_steps(steps: list, current_step: int, note: str = None):
+    """Render a horizontal step rail.
+
+    Each step dict: {"label": str, "is_move": bool (optional)}.
+    current_step is 1-based. Steps before current are done; current is active.
+    """
+    note_html = f'<p class="wizard-rail-note">{note}</p>' if note else ""
+
+    items = []
+    for index, step in enumerate(steps, start=1):
+        classes = ["wizard-step"]
+        if index < current_step:
+            classes.append("done")
+        elif index == current_step:
+            classes.append("active")
+        if step.get("is_move"):
+            classes.append("move")
+
+        tag = (
+            '<span class="wizard-tag">moves data</span>'
+            if step.get("is_move")
+            else ""
+        )
+        bullet = "✓" if index < current_step else str(index)
+        items.append(
+            f'<li class="{" ".join(classes)}">'
+            f'<span class="wizard-bullet">{bullet}</span>'
+            f'<span class="wizard-label">{step["label"]}</span>'
+            f"{tag}"
+            f"</li>"
+        )
+
+    st.markdown(
+        f'<div class="wizard-rail">{note_html}'
+        f'<ol class="wizard-steps">{"".join(items)}</ol></div>',
+        unsafe_allow_html=True,
+    )
+
+
+ACCOUNT_MOVE_WIZARD_STEPS = [
+    {"label": "Accounts"},
+    {"label": "Mode"},
+    {"label": "Confirm"},
+    {"label": "Backup"},
+    {"label": "Run move", "is_move": True},
+]
+
+
+QUEST_MIGRATE_WIZARD_STEPS = [
+    {"label": "Confirm"},
+    {"label": "Backup"},
+    {"label": "Run migrate", "is_move": True},
+]
+
+
+def account_move_current_step() -> int:
+    """Currently viewed Account Move wizard step (1-based)."""
+    step = int(st.session_state.get("am_wizard_step") or 1)
+    return max(1, min(step, 5))
+
+
+def quest_migrate_current_step() -> int:
+    """Currently viewed Quest migrate wizard step (1-based)."""
+    step = int(st.session_state.get("qm_wizard_step") or 1)
+    return max(1, min(step, 3))
+
+
+def set_account_move_step(step: int):
+    st.session_state.am_wizard_step = max(1, min(int(step), 5))
+
+
+def set_quest_migrate_step(step: int):
+    st.session_state.qm_wizard_step = max(1, min(int(step), 3))
+
+
+def wizard_back_button(label: str = "← Back", *, key: str, target_step: int, kind: str = "account_move"):
+    """Render a back button that moves the wizard view to target_step."""
+    if st.button(label, use_container_width=True, key=key):
+        if kind == "quest_migrate":
+            set_quest_migrate_step(target_step)
+        else:
+            set_account_move_step(target_step)
+        st.rerun()
+
+
+def wizard_nav_row(
+    *,
+    back_step: int = None,
+    back_key: str = None,
+    primary_label: str = None,
+    primary_key: str = None,
+    primary_disabled: bool = False,
+    primary_step: int = None,
+    kind: str = "account_move",
+):
+    """Optional Back + optional primary Continue that advances the wizard."""
+    show_back = back_step is not None and back_key
+    show_primary = primary_label and primary_key and primary_step is not None
+    if not show_back and not show_primary:
+        return
+
+    if show_back and show_primary:
+        back_col, primary_col = st.columns(2)
+        with back_col:
+            wizard_back_button(key=back_key, target_step=back_step, kind=kind)
+        with primary_col:
+            if st.button(
+                primary_label,
+                type="primary",
+                use_container_width=True,
+                disabled=primary_disabled,
+                key=primary_key,
+            ):
+                if kind == "quest_migrate":
+                    set_quest_migrate_step(primary_step)
+                else:
+                    set_account_move_step(primary_step)
+                st.rerun()
+    elif show_back:
+        wizard_back_button(key=back_key, target_step=back_step, kind=kind)
+    else:
+        if st.button(
+            primary_label,
+            type="primary",
+            use_container_width=True,
+            disabled=primary_disabled,
+            key=primary_key,
+        ):
+            if kind == "quest_migrate":
+                set_quest_migrate_step(primary_step)
+            else:
+                set_account_move_step(primary_step)
+            st.rerun()
 
 
 def location_card(name: str, location_id: str):
@@ -559,7 +799,34 @@ def show_account_move_results(
     if not results:
         return
 
-    overview = summarize_account_move_locations(results, success_label=success_label)
+    role_results = [result for result in results if result.get("type") == "role"]
+    location_results = [result for result in results if result.get("type") != "role"]
+
+    if role_results:
+        with st.container(border=True):
+            st.markdown("**Destination role**")
+            for role_result in role_results:
+                action = role_result.get("role_action") or "selected"
+                label = {
+                    "created": "Created",
+                    "matched": "Matched",
+                    "template": "Template",
+                    "selected": "Selected",
+                }.get(action, str(action).title())
+                detail = role_result.get("action") or ""
+                if action == "created":
+                    st.success(f"**{label}** — {detail}")
+                elif action == "matched":
+                    st.info(f"**{label}** — {detail}")
+                else:
+                    st.caption(f"**{label}** — {detail}")
+
+    if not location_results:
+        return
+
+    overview = summarize_account_move_locations(
+        location_results, success_label=success_label
+    )
     fully = sum(1 for row in overview if row["Outcome"] == success_label)
     partial = sum(1 for row in overview if row["Outcome"] == "Partial")
     failed = sum(1 for row in overview if row["Outcome"] == "Failed")
@@ -650,6 +917,7 @@ def init_migrate_session_state():
         "backup_bytes": None,
         "backup_filename": None,
         "backup_downloaded": False,
+        "qm_wizard_step": 1,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -663,6 +931,7 @@ def reset_from_location_change():
     st.session_state.backup_bytes = None
     st.session_state.backup_filename = None
     st.session_state.backup_downloaded = False
+    st.session_state.qm_wizard_step = 1
 
 
 def init_account_move_session_state():
@@ -674,7 +943,11 @@ def init_account_move_session_state():
         "am_role_name": None,
         "am_roles": None,
         "am_roles_account_id": None,
+        "am_source_roles": None,
+        "am_source_roles_account_id": None,
+        "am_role_resolution": None,
         "am_accounts_confirmed": False,
+        "am_wizard_step": 1,
         "am_location_id_input": "",
         "am_location_id": None,
         "am_location_name": None,
@@ -740,10 +1013,14 @@ def reset_account_move_rest():
 
 def reset_account_move_from_accounts_change():
     st.session_state.am_accounts_confirmed = False
+    st.session_state.am_wizard_step = 1
     st.session_state.am_location_id_input = ""
     st.session_state.am_roles = None
     st.session_state.am_roles_account_id = None
+    st.session_state.am_source_roles = None
+    st.session_state.am_source_roles_account_id = None
     st.session_state.am_role_group_id = ""
     st.session_state.am_role_name = None
+    st.session_state.am_role_resolution = None
     reset_account_move_per_location()
     reset_account_move_rest()
