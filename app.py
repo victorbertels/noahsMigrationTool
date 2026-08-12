@@ -14,6 +14,7 @@ from account_migration import (
     fetch_move_snapshot,
     has_migrated_marker,
     load_account_move_backup_zip,
+    role_resolution_result,
     run_account_move,
     run_account_move_revert,
 )
@@ -320,10 +321,28 @@ def _account_move_context_caption():
         if st.session_state.am_mode == "per_location"
         else "Rest of account"
     )
+    resolution = st.session_state.get("am_role_resolution") or {}
+    action = resolution.get("action")
+    role_note = {
+        "created": "created",
+        "matched": "matched",
+        "template": "template",
+        "selected": "selected",
+    }.get(action, "selected")
     st.caption(
         f"`{st.session_state.am_old_account_id}` → `{st.session_state.am_new_account_id}` · "
-        f"{mode_label} · role **{role_label}**"
+        f"{mode_label} · role **{role_label}** ({role_note})"
     )
+
+
+def _account_move_with_role_result(results: list[dict]) -> list[dict]:
+    """Prepend destination-role matched/created info to move results."""
+    role_row = role_resolution_result(
+        st.session_state.get("am_role_resolution"),
+        fallback_role_id=st.session_state.get("am_role_group_id"),
+        fallback_role_name=st.session_state.get("am_role_name"),
+    )
+    return [role_row, *results]
 
 
 def _account_move_step_accounts():
@@ -444,8 +463,29 @@ def _account_move_step_accounts():
                     key="am_role_select",
                     help="Quest users will be assigned this role on the destination account.",
                 )
+                previous_resolution = st.session_state.get("am_role_resolution") or {}
                 st.session_state.am_role_group_id = selected_id
                 st.session_state.am_role_name = role_labels.get(selected_id, selected_id)
+                # Manual pick (or changed after recreate) counts as selected existing.
+                if previous_resolution.get("destination_role_id") != selected_id:
+                    st.session_state.am_role_resolution = {
+                        "action": "selected",
+                        "destination_role_id": selected_id,
+                        "role_name": st.session_state.am_role_name,
+                        "source_role_id": None,
+                        "source_role_name": None,
+                    }
+                resolution = st.session_state.get("am_role_resolution") or {}
+                if resolution.get("action") == "created":
+                    st.success(
+                        f"Role will be used as **created**: "
+                        f"{st.session_state.am_role_name}"
+                    )
+                elif resolution.get("action") == "matched":
+                    st.info(
+                        f"Role will be used as **matched** (already on destination): "
+                        f"{st.session_state.am_role_name}"
+                    )
             else:
                 st.session_state.am_role_group_id = ""
                 st.session_state.am_role_name = None
@@ -513,6 +553,15 @@ def _account_move_step_accounts():
                             st.session_state.am_role_name = (
                                 dest_role.get("name") or dest_role.get("_id")
                             )
+                            st.session_state.am_role_resolution = {
+                                "action": action,
+                                "destination_role_id": dest_role.get("_id"),
+                                "role_name": st.session_state.am_role_name,
+                                "source_role_id": recreate_source_id,
+                                "source_role_name": source_role.get("name")
+                                if source_role
+                                else None,
+                            }
                             track_event(
                                 "account_move_role_recreated",
                                 action="account_move",
@@ -523,17 +572,17 @@ def _account_move_step_accounts():
                             )
                             if action == "created":
                                 st.success(
-                                    f"Created **{st.session_state.am_role_name}** on the "
-                                    "destination account and selected it."
+                                    f"**Created** destination role "
+                                    f"**{st.session_state.am_role_name}** and selected it."
                                 )
-                            elif action == "already_exists":
+                            elif action == "matched":
                                 st.info(
-                                    f"**{st.session_state.am_role_name}** already exists on "
-                                    "the destination — selected it (no duplicate created)."
+                                    f"**Matched** existing destination role "
+                                    f"**{st.session_state.am_role_name}** — not recreated."
                                 )
                             else:
                                 st.info(
-                                    f"Using template role **{st.session_state.am_role_name}** "
+                                    f"**Template** role **{st.session_state.am_role_name}** "
                                     "(global — not recreated)."
                                 )
                             st.rerun()
@@ -1014,15 +1063,19 @@ def _account_move_run_step(
                         destination_account_id,
                         role_group_id,
                     )
+                    results = _account_move_with_role_result(results)
                     track_event(
                         "account_move_run",
                         action="account_move",
                         mode="per_location",
                         location_id=st.session_state.am_location_id,
+                        role_action=(
+                            (st.session_state.get("am_role_resolution") or {}).get("action")
+                        ),
                         success=all(
                             result.get("ok", True)
                             for result in results
-                            if result.get("type") != "warning"
+                            if result.get("type") not in ("warning", "role")
                         ),
                     )
                     show_account_move_results(results)
@@ -1048,15 +1101,19 @@ def _account_move_run_step(
                         destination_account_id,
                         role_group_id,
                     )
+                    results = _account_move_with_role_result(results)
                     track_event(
                         "account_move_run",
                         action="account_move",
                         mode="rest_of_account",
                         location_count=len(location_ids),
+                        role_action=(
+                            (st.session_state.get("am_role_resolution") or {}).get("action")
+                        ),
                         success=all(
                             result.get("ok", True)
                             for result in results
-                            if result.get("type") != "warning"
+                            if result.get("type") not in ("warning", "role")
                         ),
                     )
                     show_account_move_results(results)

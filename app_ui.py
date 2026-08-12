@@ -799,7 +799,34 @@ def show_account_move_results(
     if not results:
         return
 
-    overview = summarize_account_move_locations(results, success_label=success_label)
+    role_results = [result for result in results if result.get("type") == "role"]
+    location_results = [result for result in results if result.get("type") != "role"]
+
+    if role_results:
+        with st.container(border=True):
+            st.markdown("**Destination role**")
+            for role_result in role_results:
+                action = role_result.get("role_action") or "selected"
+                label = {
+                    "created": "Created",
+                    "matched": "Matched",
+                    "template": "Template",
+                    "selected": "Selected",
+                }.get(action, str(action).title())
+                detail = role_result.get("action") or ""
+                if action == "created":
+                    st.success(f"**{label}** — {detail}")
+                elif action == "matched":
+                    st.info(f"**{label}** — {detail}")
+                else:
+                    st.caption(f"**{label}** — {detail}")
+
+    if not location_results:
+        return
+
+    overview = summarize_account_move_locations(
+        location_results, success_label=success_label
+    )
     fully = sum(1 for row in overview if row["Outcome"] == success_label)
     partial = sum(1 for row in overview if row["Outcome"] == "Partial")
     failed = sum(1 for row in overview if row["Outcome"] == "Failed")
@@ -918,6 +945,7 @@ def init_account_move_session_state():
         "am_roles_account_id": None,
         "am_source_roles": None,
         "am_source_roles_account_id": None,
+        "am_role_resolution": None,
         "am_accounts_confirmed": False,
         "am_wizard_step": 1,
         "am_location_id_input": "",
@@ -993,5 +1021,6 @@ def reset_account_move_from_accounts_change():
     st.session_state.am_source_roles_account_id = None
     st.session_state.am_role_group_id = ""
     st.session_state.am_role_name = None
+    st.session_state.am_role_resolution = None
     reset_account_move_per_location()
     reset_account_move_rest()
