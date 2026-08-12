@@ -46,6 +46,111 @@ def apply_styles():
                 border-radius: 999px;
                 margin-bottom: 0.35rem;
             }
+            .wizard-rail {
+                background: #f7f8fc;
+                border: 1px solid #e2e6f3;
+                border-radius: 12px;
+                padding: 0.9rem 1rem 1rem 1rem;
+                margin: 0 0 1.1rem 0;
+            }
+            .wizard-rail-note {
+                font-size: 0.82rem;
+                color: #6b7280;
+                margin: 0 0 0.65rem 0;
+            }
+            .wizard-rail-note strong {
+                color: #b45309;
+            }
+            .wizard-steps {
+                display: flex;
+                flex-wrap: wrap;
+                align-items: flex-start;
+                gap: 0.35rem 0;
+                list-style: none;
+                margin: 0;
+                padding: 0;
+            }
+            .wizard-step {
+                display: flex;
+                align-items: center;
+                gap: 0.4rem;
+                min-width: 0;
+            }
+            .wizard-step + .wizard-step::before {
+                content: "";
+                width: 1.1rem;
+                height: 2px;
+                background: #d1d5db;
+                margin: 0 0.35rem 0 0.15rem;
+                flex-shrink: 0;
+            }
+            .wizard-bullet {
+                width: 1.35rem;
+                height: 1.35rem;
+                border-radius: 999px;
+                border: 2px solid #c5cbe3;
+                background: #ffffff;
+                color: #6b7280;
+                font-size: 0.72rem;
+                font-weight: 700;
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                flex-shrink: 0;
+            }
+            .wizard-label {
+                font-size: 0.82rem;
+                font-weight: 600;
+                color: #6b7280;
+                white-space: nowrap;
+            }
+            .wizard-tag {
+                font-size: 0.65rem;
+                font-weight: 700;
+                letter-spacing: 0.04em;
+                text-transform: uppercase;
+                color: #b45309;
+                background: #fff7ed;
+                border: 1px solid #fed7aa;
+                border-radius: 999px;
+                padding: 0.1rem 0.4rem;
+                margin-left: 0.15rem;
+            }
+            .wizard-step.done .wizard-bullet {
+                background: #ecfdf5;
+                border-color: #34d399;
+                color: #047857;
+            }
+            .wizard-step.done .wizard-label {
+                color: #047857;
+            }
+            .wizard-step.done + .wizard-step::before {
+                background: #6ee7b7;
+            }
+            .wizard-step.active .wizard-bullet {
+                background: #3d4f9f;
+                border-color: #3d4f9f;
+                color: #ffffff;
+            }
+            .wizard-step.active .wizard-label {
+                color: #1a1f36;
+            }
+            .wizard-step.move .wizard-bullet {
+                border-color: #f59e0b;
+            }
+            .wizard-step.move.active .wizard-bullet {
+                background: #b45309;
+                border-color: #b45309;
+                color: #ffffff;
+            }
+            .wizard-step.move.active .wizard-label {
+                color: #92400e;
+            }
+            .wizard-step.move.done .wizard-bullet {
+                background: #fff7ed;
+                border-color: #f59e0b;
+                color: #b45309;
+            }
             .location-card {
                 background: #f7f8fc;
                 border: 1px solid #e2e6f3;
@@ -205,6 +310,93 @@ def step_heading(title: str, step: str = None):
     if step:
         st.markdown(f'<span class="step-label">Step {step}</span>', unsafe_allow_html=True)
     st.markdown(f"#### {title}")
+
+
+def wizard_steps(steps: list[dict], current_step: int, note: str | None = None):
+    """Render a horizontal step rail.
+
+    Each step dict: {"label": str, "is_move": bool (optional)}.
+    current_step is 1-based. Steps before current are done; current is active.
+    """
+    note_html = ""
+    if note:
+        note_html = f'<p class="wizard-rail-note">{note}</p>'
+
+    items = []
+    for index, step in enumerate(steps, start=1):
+        classes = ["wizard-step"]
+        if index < current_step:
+            classes.append("done")
+        elif index == current_step:
+            classes.append("active")
+        if step.get("is_move"):
+            classes.append("move")
+
+        tag = (
+            '<span class="wizard-tag">moves data</span>'
+            if step.get("is_move")
+            else ""
+        )
+        bullet = "✓" if index < current_step else str(index)
+        items.append(
+            f'<li class="{" ".join(classes)}">'
+            f'<span class="wizard-bullet">{bullet}</span>'
+            f'<span class="wizard-label">{step["label"]}</span>'
+            f"{tag}"
+            f"</li>"
+        )
+
+    st.markdown(
+        f'<div class="wizard-rail">{note_html}'
+        f'<ol class="wizard-steps">{"".join(items)}</ol></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def account_move_current_step() -> int:
+    """1-based wizard step for Account Move, based on session gates."""
+    if not st.session_state.get("am_accounts_confirmed"):
+        return 1
+    if st.session_state.get("am_mode") == "per_location":
+        if not st.session_state.get("am_location_id"):
+            return 2
+        if not st.session_state.get("am_confirmed"):
+            return 3
+        if not st.session_state.get("am_backup_downloaded"):
+            return 4
+        return 5
+    # rest_of_account — mode is chosen; highlight load/confirm until backup/run.
+    if not st.session_state.get("am_rest_loaded"):
+        return 3
+    if not st.session_state.get("am_backup_downloaded"):
+        if not st.session_state.get("am_backup_bytes"):
+            return 3
+        return 4
+    return 5
+
+
+ACCOUNT_MOVE_WIZARD_STEPS = [
+    {"label": "Accounts"},
+    {"label": "Mode"},
+    {"label": "Confirm"},
+    {"label": "Backup"},
+    {"label": "Run move", "is_move": True},
+]
+
+
+QUEST_MIGRATE_WIZARD_STEPS = [
+    {"label": "Confirm"},
+    {"label": "Backup"},
+    {"label": "Run migrate", "is_move": True},
+]
+
+
+def quest_migrate_current_step() -> int:
+    if not st.session_state.get("location_confirmed"):
+        return 1
+    if not st.session_state.get("backup_downloaded"):
+        return 2
+    return 3
 
 
 def location_card(name: str, location_id: str):

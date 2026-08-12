@@ -6,10 +6,14 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from api import (
+    build_role_duplicate_payload,
+    create_role,
     get_channel_link,
     get_location,
+    get_role,
     get_user,
     list_all_locations,
+    list_all_roles,
     list_all_users,
     patch_channel_link,
     patch_location,
@@ -119,6 +123,141 @@ def _require_role_group(role_group_id: str):
         raise AccountMoveGuardrailError(
             "Destination role ID is required before moving Quest users."
         )
+
+
+def _role_name_key(name: Optional[str]) -> str:
+    return (name or "").strip().lower()
+
+
+def index_roles_by_id(roles: list[dict]) -> dict[str, dict]:
+    return {
+        str(role.get("_id")): role
+        for role in roles
+        if role.get("_id") is not None
+    }
+
+
+def index_roles_by_name(roles: list[dict]) -> dict[str, dict]:
+    by_name: dict[str, dict] = {}
+    for role in roles:
+        key = _role_name_key(role.get("name"))
+        if key and key not in by_name:
+            by_name[key] = role
+    return by_name
+
+
+def _lookup_role(
+    role_id: str,
+    roles_by_id: dict[str, dict],
+) -> Optional[dict]:
+    if role_id in roles_by_id:
+        return roles_by_id[role_id]
+    role, status = get_role(role_id)
+    if status == 200 and isinstance(role, dict) and role.get("_id"):
+        roles_by_id[str(role["_id"])] = role
+        return role
+    return None
+
+
+def resolve_or_duplicate_destination_role(
+    source_role_id: Optional[str],
+    destination_account_id: str,
+    destination_roles_by_id: dict[str, dict],
+    destination_roles_by_name: dict[str, dict],
+    source_roles_by_id: dict[str, dict],
+    fallback_role_id: Optional[str] = None,
+    created_by_source_role_id: Optional[dict[str, str]] = None,
+) -> tuple[str, str]:
+    """Pick a destination role for a Quest user.
+
+    Preference order:
+    1. Same role id if it already exists on destination (e.g. global templates)
+    2. Destination role with the same name
+    3. Duplicate the source role onto the destination account
+    4. Fallback destination role selected in the UI
+
+    Returns (destination_role_id, resolution_note).
+    """
+    cache = created_by_source_role_id if created_by_source_role_id is not None else {}
+    source_id = str(source_role_id).strip() if source_role_id else ""
+
+    if source_id and source_id in cache:
+        return cache[source_id], "reused previously duplicated role"
+
+    if source_id and source_id in destination_roles_by_id:
+        return source_id, "same role id on destination"
+
+    source_role = _lookup_role(source_id, source_roles_by_id) if source_id else None
+    if source_role:
+        # Template roles are global — reuse the same id on any account.
+        if source_role.get("template"):
+            if source_id:
+                cache[source_id] = source_id
+            return source_id, "template role"
+
+        name_key = _role_name_key(source_role.get("name"))
+        matched = destination_roles_by_name.get(name_key) if name_key else None
+        if matched and matched.get("_id"):
+            dest_id = str(matched["_id"])
+            if source_id:
+                cache[source_id] = dest_id
+            return dest_id, f"matched by name '{source_role.get('name')}'"
+
+        # Duplicate custom (or missing) role onto destination.
+        try:
+            payload = build_role_duplicate_payload(source_role, destination_account_id)
+        except ValueError as error:
+            if fallback_role_id:
+                return str(fallback_role_id), f"fallback ({error})"
+            raise AccountMoveGuardrailError(str(error)) from error
+
+        created, status = create_role(payload)
+        if 200 <= status < 300 and isinstance(created, dict) and created.get("_id"):
+            dest_id = str(created["_id"])
+            destination_roles_by_id[dest_id] = created
+            if name_key:
+                destination_roles_by_name[name_key] = created
+            if source_id:
+                cache[source_id] = dest_id
+            return dest_id, f"duplicated '{source_role.get('name')}' onto destination"
+
+        # Race: another create may have landed the same name — reload by name.
+        try:
+            refreshed = list_all_roles(destination_account_id)
+        except Exception:
+            refreshed = []
+        for role in refreshed:
+            rid = role.get("_id")
+            if rid is not None:
+                destination_roles_by_id[str(rid)] = role
+            key = _role_name_key(role.get("name"))
+            if key and key not in destination_roles_by_name:
+                destination_roles_by_name[key] = role
+        matched = destination_roles_by_name.get(name_key) if name_key else None
+        if matched and matched.get("_id"):
+            dest_id = str(matched["_id"])
+            if source_id:
+                cache[source_id] = dest_id
+            return dest_id, f"matched by name after create conflict '{source_role.get('name')}'"
+
+        detail = created if isinstance(created, dict) else {}
+        message = detail.get("_error", {}).get("message") or detail.get("message") or created
+        if fallback_role_id:
+            return (
+                str(fallback_role_id),
+                f"fallback (could not duplicate role: HTTP {status} {message})",
+            )
+        raise AccountMoveGuardrailError(
+            f"Could not duplicate role '{source_role.get('name')}' onto destination "
+            f"(HTTP {status}): {message}"
+        )
+
+    if fallback_role_id:
+        return str(fallback_role_id), "fallback destination role"
+
+    raise AccountMoveGuardrailError(
+        "Quest user has no role, and no fallback destination role was selected."
+    )
 
 
 def validate_location_belongs(location: dict, account_id: str, label: str = "Location"):
@@ -513,6 +652,10 @@ def _move_single_location(
     retained_channel_link_ids: Optional[list] = None,
     users: Optional[list] = None,
     role_group_id: Optional[str] = None,
+    destination_roles_by_id: Optional[dict[str, dict]] = None,
+    destination_roles_by_name: Optional[dict[str, dict]] = None,
+    source_roles_by_id: Optional[dict[str, dict]] = None,
+    created_roles_by_source_id: Optional[dict[str, str]] = None,
     on_progress=None,
 ) -> list[dict]:
     results = []
@@ -724,7 +867,22 @@ def _move_single_location(
 
     quest_users = list(users or [])
     if quest_users:
-        _require_role_group(role_group_id or "")
+        dest_by_id = destination_roles_by_id if destination_roles_by_id is not None else {}
+        dest_by_name = (
+            destination_roles_by_name if destination_roles_by_name is not None else {}
+        )
+        source_by_id = source_roles_by_id if source_roles_by_id is not None else {}
+        created_cache = (
+            created_roles_by_source_id if created_roles_by_source_id is not None else {}
+        )
+        # Load role indexes lazily if the caller did not provide them.
+        if destination_roles_by_id is None or destination_roles_by_name is None:
+            dest_roles = list_all_roles(destination_account_id)
+            dest_by_id = index_roles_by_id(dest_roles)
+            dest_by_name = index_roles_by_name(dest_roles)
+        if source_roles_by_id is None:
+            source_by_id = index_roles_by_id(list_all_roles(original_account_id))
+
         for user in quest_users:
             user_id = user["_id"]
             user_label = user.get("name") or user.get("email") or user_id
@@ -771,10 +929,36 @@ def _move_single_location(
                 )
                 continue
 
+            try:
+                resolved_role_id, resolution = resolve_or_duplicate_destination_role(
+                    current_user.get("role") or user.get("role"),
+                    destination_account_id,
+                    dest_by_id,
+                    dest_by_name,
+                    source_by_id,
+                    fallback_role_id=role_group_id,
+                    created_by_source_role_id=created_cache,
+                )
+            except AccountMoveGuardrailError as error:
+                results.append(
+                    {
+                        "type": "user",
+                        "id": user_id,
+                        "name": user_label,
+                        "action": (
+                            f"Could not resolve destination role for {user_label}: {error}"
+                        ),
+                        "status": None,
+                        "ok": False,
+                        **location_meta,
+                    }
+                )
+                continue
+
             user_payload = {
                 "account": destination_account_id,
                 "locations": [destination_id],
-                "role": role_group_id,
+                "role": resolved_role_id,
             }
             user_response, user_patch_status = patch_user(
                 user_id,
@@ -788,7 +972,8 @@ def _move_single_location(
                     "name": user_label,
                     "action": (
                         f"Moved user {user_label} to destination account / "
-                        f"{destination_name} with role {role_group_id}."
+                        f"{destination_name} with role {resolved_role_id} "
+                        f"({resolution})."
                     ),
                     "status": user_patch_status,
                     "ok": 200 <= user_patch_status < 300,
@@ -796,7 +981,7 @@ def _move_single_location(
                     **location_meta,
                 }
             )
-    elif role_group_id:
+    else:
         results.append(
             {
                 "type": "warning",
@@ -818,9 +1003,16 @@ def run_account_move(
     on_progress=None,
 ) -> list[dict]:
     _require_accounts(original_account_id, destination_account_id)
-    _require_role_group(role_group_id)
+    # Fallback role is optional — we match/duplicate each Quest user's current role.
+    fallback_role = (role_group_id or "").strip() or None
     destination_locations = list_all_locations(destination_account_id)
     original_users = list_all_users(original_account_id)
+    destination_roles = list_all_roles(destination_account_id)
+    source_roles = list_all_roles(original_account_id)
+    destination_roles_by_id = index_roles_by_id(destination_roles)
+    destination_roles_by_name = index_roles_by_name(destination_roles)
+    source_roles_by_id = index_roles_by_id(source_roles)
+    created_roles_by_source_id: dict[str, str] = {}
     results = []
     total = max(len(original_location_ids), 1)
     step = 0
@@ -903,7 +1095,11 @@ def run_account_move(
                     item["_id"] for item in snapshot.get("retained_channel_links") or []
                 ],
                 users=snapshot.get("users") or [],
-                role_group_id=role_group_id,
+                role_group_id=fallback_role,
+                destination_roles_by_id=destination_roles_by_id,
+                destination_roles_by_name=destination_roles_by_name,
+                source_roles_by_id=source_roles_by_id,
+                created_roles_by_source_id=created_roles_by_source_id,
                 on_progress=_location_progress,
             )
         )

@@ -27,6 +27,9 @@ from migration import (
     validate_location_account,
 )
 from app_ui import (
+    ACCOUNT_MOVE_WIZARD_STEPS,
+    QUEST_MIGRATE_WIZARD_STEPS,
+    account_move_current_step,
     account_move_format_box,
     account_move_match_summary,
     apply_styles,
@@ -36,6 +39,7 @@ from app_ui import (
     init_migrate_session_state,
     load_credentials,
     location_card,
+    quest_migrate_current_step,
     render_header,
     render_nav,
     render_password_gate,
@@ -46,10 +50,16 @@ from app_ui import (
     show_account_move_results,
     show_results,
     step_heading,
+    wizard_steps,
 )
 
 
 def migrate_page(allowed_account_id: str):
+    wizard_steps(
+        QUEST_MIGRATE_WIZARD_STEPS,
+        quest_migrate_current_step(),
+        note="Only <strong>Run migrate</strong> changes live data. Earlier steps are confirm &amp; backup.",
+    )
     with st.container(border=True):
         step_heading("Confirm location", "1")
         location_id_input = st.text_input(
@@ -136,6 +146,7 @@ def migrate_page(allowed_account_id: str):
     if st.session_state.location_confirmed and st.session_state.backup_downloaded:
         with st.container(border=True):
             step_heading("Run migration", "3")
+            st.warning("This is the live migration. Location and channel settings will be updated.")
             st.caption("Updates Wolt channels to retail, routes food channels to Quest, and tags the location.")
 
             if st.button("Run migration", type="primary", use_container_width=True):
@@ -413,9 +424,14 @@ def _account_move_per_location(
     if st.session_state.am_confirmed and st.session_state.am_backup_downloaded:
         with st.container(border=True):
             step_heading("Run account move", "5")
+            st.warning(
+                "This is the live move. Channel links, location names, and Quest users "
+                "will be updated on Deliverect."
+            )
             st.caption(
                 "Moves channel links to the destination account/location, clears them on the "
-                "original, and appends `#MIGRATEDTO{destinationId}#` to the original name."
+                "original (except Test Channel), appends `#MIGRATEDTO{destinationId}#` to the "
+                "original name, and assigns each Quest user a matched or duplicated role."
             )
             if st.button("Run account move", type="primary", use_container_width=True, key="am_run"):
                 try:
@@ -632,7 +648,14 @@ def _account_move_rest_of_account(
     if st.session_state.am_backup_downloaded:
         with st.container(border=True):
             step_heading("Run account move", "5")
-            st.caption(f"Moves channel links for {len(ready)} location(s).")
+            st.warning(
+                "This is the live move. Channel links, location names, and Quest users "
+                f"will be updated for {len(ready)} ready location(s)."
+            )
+            st.caption(
+                "Same as per-location: channel links move, original gets `#MIGRATEDTO…#`, "
+                "Quest users get a matched or duplicated role."
+            )
             if st.button(
                 "Run account move for ready locations",
                 type="primary",
@@ -668,11 +691,17 @@ def _account_move_rest_of_account(
 
 
 def account_move_page():
+    wizard_steps(
+        ACCOUNT_MOVE_WIZARD_STEPS,
+        account_move_current_step(),
+        note="Only <strong>Run move</strong> changes live data. Steps 1–4 are setup, confirm &amp; backup.",
+    )
     with st.container(border=True):
         step_heading("Accounts", "1")
         st.caption(
-            "Enter the old/new Deliverect account IDs, then pick a destination role "
-            "for Quest users (exactly one linked location)."
+            "Enter the old/new Deliverect account IDs. Quest users keep their current role when "
+            "possible: we match it by name on the destination, or duplicate it if missing. "
+            "Pick a fallback destination role below for users that have no role."
         )
 
         old_col, new_col = st.columns(2)
@@ -738,7 +767,10 @@ def account_move_page():
 
             roles = st.session_state.am_roles or []
             if not roles:
-                st.warning("No roles found on the destination account.")
+                st.info(
+                    "No roles found on the destination account yet. "
+                    "Quest users' roles will be duplicated from the old account during the move."
+                )
                 role_ids = []
                 role_labels = {}
             else:
@@ -750,28 +782,38 @@ def account_move_page():
                 }
 
             if role_ids:
-                current_role = st.session_state.am_role_group_id
-                if current_role not in role_ids:
-                    current_role = role_ids[0]
+                none_option = ""
+                options = [none_option] + role_ids
+                current_role = st.session_state.am_role_group_id or none_option
+                if current_role not in options:
+                    current_role = none_option
                 selected_id = st.selectbox(
-                    "Destination role",
-                    options=role_ids,
-                    index=role_ids.index(current_role),
-                    format_func=lambda role_id: f"{role_labels.get(role_id, role_id)} ({role_id})",
+                    "Fallback destination role (optional)",
+                    options=options,
+                    index=options.index(current_role),
+                    format_func=lambda role_id: (
+                        "— None (match/duplicate each Quest user's role) —"
+                        if role_id == none_option
+                        else f"{role_labels.get(role_id, role_id)} ({role_id})"
+                    ),
                     key="am_role_select",
-                    help="Quest users will be assigned this role on the destination account.",
+                    help=(
+                        "Used only when a Quest user has no role, or their role cannot be "
+                        "matched/duplicated. Otherwise each user keeps a same-named "
+                        "(or newly duplicated) role."
+                    ),
                 )
-                st.session_state.am_role_group_id = selected_id
-                st.session_state.am_role_name = role_labels.get(selected_id, selected_id)
+                if selected_id:
+                    st.session_state.am_role_group_id = selected_id
+                    st.session_state.am_role_name = role_labels.get(selected_id, selected_id)
+                else:
+                    st.session_state.am_role_group_id = ""
+                    st.session_state.am_role_name = None
             else:
                 st.session_state.am_role_group_id = ""
                 st.session_state.am_role_name = None
 
-        accounts_ready = bool(
-            accounts_match_ok and st.session_state.am_role_group_id
-        )
-        if accounts_match_ok and not st.session_state.am_role_group_id:
-            st.caption("Select a destination role to continue.")
+        accounts_ready = accounts_match_ok
 
         if not st.session_state.am_accounts_confirmed:
             if st.button(
@@ -787,17 +829,22 @@ def account_move_page():
                     action="account_move",
                     old_account_id=st.session_state.am_old_account_id,
                     new_account_id=st.session_state.am_new_account_id,
-                    role_group_id=st.session_state.am_role_group_id,
+                    role_group_id=st.session_state.am_role_group_id or None,
                     role_name=st.session_state.am_role_name,
                 )
                 st.rerun()
             return
 
-        role_label = st.session_state.am_role_name or st.session_state.am_role_group_id
+        if st.session_state.am_role_group_id:
+            role_label = st.session_state.am_role_name or st.session_state.am_role_group_id
+            role_note = (
+                f"fallback role **{role_label}** (`{st.session_state.am_role_group_id}`)"
+            )
+        else:
+            role_note = "Quest roles matched/duplicated from each user (no fallback selected)"
         st.success(
             f"Moving from `{st.session_state.am_old_account_id}` → "
-            f"`{st.session_state.am_new_account_id}` · "
-            f"role **{role_label}** (`{st.session_state.am_role_group_id}`)"
+            f"`{st.session_state.am_new_account_id}` · {role_note}"
         )
         if st.button("Change accounts", use_container_width=True, key="am_change_accounts"):
             reset_account_move_from_accounts_change()
