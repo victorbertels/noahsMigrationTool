@@ -17,7 +17,7 @@ from account_migration import (
     run_account_move_revert,
 )
 from analytics import track_event, track_page
-from api import get_location, list_all_locations, list_all_roles
+from deliverect_api import get_location, list_all_locations, list_all_roles
 from migration import (
     AccountGuardrailError,
     create_backup_zip,
