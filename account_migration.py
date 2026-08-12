@@ -6,10 +6,13 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from api import (
+    build_role_duplicate_payload,
+    create_role,
     get_channel_link,
     get_location,
     get_user,
     list_all_locations,
+    list_all_roles,
     list_all_users,
     patch_channel_link,
     patch_location,
@@ -119,6 +122,76 @@ def _require_role_group(role_group_id: str):
         raise AccountMoveGuardrailError(
             "Destination role ID is required before moving Quest users."
         )
+
+
+def _role_name_key(name: Optional[str]) -> str:
+    return (name or "").strip().lower()
+
+
+def find_role_by_name(roles: list[dict], name: Optional[str]) -> Optional[dict]:
+    key = _role_name_key(name)
+    if not key:
+        return None
+    for role in roles:
+        if _role_name_key(role.get("name")) == key:
+            return role
+    return None
+
+
+def ensure_destination_role_from_source(
+    source_role: dict,
+    destination_account_id: str,
+    destination_roles: Optional[list[dict]] = None,
+) -> tuple[dict, str]:
+    """Ensure a destination role exists for a source role — without creating duplicates.
+
+    Preference:
+    1. Global template roles → reuse the same role id
+    2. Destination role with the same name (case-insensitive) → reuse it
+    3. Otherwise create one copy on the destination account
+
+    Returns (destination_role, action) where action is
+    "template" | "already_exists" | "created".
+    """
+    if not source_role:
+        raise AccountMoveGuardrailError("Source role is required to recreate.")
+
+    source_id = str(source_role.get("_id") or "").strip()
+    name = (source_role.get("name") or "").strip()
+    if not name and not source_role.get("template"):
+        raise AccountMoveGuardrailError("Source role has no name; cannot recreate.")
+
+    dest_roles = list(destination_roles) if destination_roles is not None else list_all_roles(
+        destination_account_id
+    )
+
+    # Templates are global — never recreate them as custom account roles.
+    if source_role.get("template") and source_id:
+        for role in dest_roles:
+            if str(role.get("_id")) == source_id:
+                return role, "template"
+        return source_role, "template"
+
+    existing = find_role_by_name(dest_roles, name)
+    if existing and existing.get("_id"):
+        return existing, "already_exists"
+
+    payload = build_role_duplicate_payload(source_role, destination_account_id)
+    created, status = create_role(payload)
+    if 200 <= status < 300 and isinstance(created, dict) and created.get("_id"):
+        return created, "created"
+
+    # Likely a unique-name race / conflict — reload and reuse the existing name.
+    refreshed = list_all_roles(destination_account_id)
+    existing = find_role_by_name(refreshed, name)
+    if existing and existing.get("_id"):
+        return existing, "already_exists"
+
+    detail = created if isinstance(created, dict) else {}
+    message = detail.get("_error", {}).get("message") or detail.get("message") or created
+    raise AccountMoveGuardrailError(
+        f"Could not recreate role '{name}' on destination (HTTP {status}): {message}"
+    )
 
 
 def validate_location_belongs(location: dict, account_id: str, label: str = "Location"):

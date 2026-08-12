@@ -10,6 +10,7 @@ from account_migration import (
     AccountMoveGuardrailError,
     classify_account_locations,
     create_account_move_backup_zip,
+    ensure_destination_role_from_source,
     fetch_move_snapshot,
     has_migrated_marker,
     load_account_move_backup_zip,
@@ -27,6 +28,9 @@ from migration import (
     validate_location_account,
 )
 from app_ui import (
+    ACCOUNT_MOVE_WIZARD_STEPS,
+    QUEST_MIGRATE_WIZARD_STEPS,
+    account_move_current_step,
     account_move_format_box,
     account_move_match_summary,
     apply_styles,
@@ -36,6 +40,7 @@ from app_ui import (
     init_migrate_session_state,
     load_credentials,
     location_card,
+    quest_migrate_current_step,
     render_header,
     render_nav,
     render_password_gate,
@@ -46,10 +51,16 @@ from app_ui import (
     show_account_move_results,
     show_results,
     step_heading,
+    wizard_steps,
 )
 
 
 def migrate_page(allowed_account_id: str):
+    wizard_steps(
+        QUEST_MIGRATE_WIZARD_STEPS,
+        quest_migrate_current_step(),
+        note="Only <strong>Run migrate</strong> changes live data. Earlier steps are confirm &amp; backup.",
+    )
     with st.container(border=True):
         step_heading("Confirm location", "1")
         location_id_input = st.text_input(
@@ -136,6 +147,7 @@ def migrate_page(allowed_account_id: str):
     if st.session_state.location_confirmed and st.session_state.backup_downloaded:
         with st.container(border=True):
             step_heading("Run migration", "3")
+            st.warning("This is the live migration. Location and channel settings will be updated.")
             st.caption("Updates Wolt channels to retail, routes food channels to Quest, and tags the location.")
 
             if st.button("Run migration", type="primary", use_container_width=True):
@@ -413,6 +425,10 @@ def _account_move_per_location(
     if st.session_state.am_confirmed and st.session_state.am_backup_downloaded:
         with st.container(border=True):
             step_heading("Run account move", "5")
+            st.warning(
+                "This is the live move. Channel links, location names, and Quest users "
+                "will be updated on Deliverect."
+            )
             st.caption(
                 "Moves channel links to the destination account/location, clears them on the "
                 "original, and appends `#MIGRATEDTO{destinationId}#` to the original name."
@@ -632,6 +648,10 @@ def _account_move_rest_of_account(
     if st.session_state.am_backup_downloaded:
         with st.container(border=True):
             step_heading("Run account move", "5")
+            st.warning(
+                "This is the live move. Channel links, location names, and Quest users "
+                f"will be updated for {len(ready)} ready location(s)."
+            )
             st.caption(f"Moves channel links for {len(ready)} location(s).")
             if st.button(
                 "Run account move for ready locations",
@@ -668,11 +688,17 @@ def _account_move_rest_of_account(
 
 
 def account_move_page():
+    wizard_steps(
+        ACCOUNT_MOVE_WIZARD_STEPS,
+        account_move_current_step(),
+        note="Only <strong>Run move</strong> changes live data. Steps 1–4 are setup, confirm &amp; backup.",
+    )
     with st.container(border=True):
         step_heading("Accounts", "1")
         st.caption(
             "Enter the old/new Deliverect account IDs, then pick a destination role "
-            "for Quest users (exactly one linked location)."
+            "for Quest users (exactly one linked location). If the right role is missing, "
+            "recreate it once from the old account — same name is reused, never duplicated."
         )
 
         old_col, new_col = st.columns(2)
@@ -709,7 +735,7 @@ def account_move_page():
             st.error("Old and new account IDs must be different.")
             accounts_match_ok = False
 
-        # Load destination roles once the new account ID is set.
+        # Load destination + source roles once account IDs are set.
         if accounts_match_ok:
             if (
                 st.session_state.am_roles is None
@@ -718,14 +744,12 @@ def account_move_page():
                 try:
                     with st.spinner("Loading destination roles…"):
                         roles = list_all_roles(st.session_state.am_new_account_id)
-                    # Prefer a readable name field; fall back to _id.
                     roles = sorted(
                         roles,
                         key=lambda role: (role.get("name") or role.get("_id") or "").lower(),
                     )
                     st.session_state.am_roles = roles
                     st.session_state.am_roles_account_id = st.session_state.am_new_account_id
-                    # Clear previous selection if roles were reloaded for a new account.
                     if st.session_state.am_role_group_id and not any(
                         role.get("_id") == st.session_state.am_role_group_id for role in roles
                     ):
@@ -734,11 +758,37 @@ def account_move_page():
                 except Exception as error:
                     st.session_state.am_roles = []
                     st.session_state.am_roles_account_id = st.session_state.am_new_account_id
-                    st.error(f"Could not load roles: {error}")
+                    st.error(f"Could not load destination roles: {error}")
+
+            if (
+                st.session_state.am_source_roles is None
+                or st.session_state.am_source_roles_account_id
+                != st.session_state.am_old_account_id
+            ):
+                try:
+                    with st.spinner("Loading old-account roles…"):
+                        source_roles = list_all_roles(st.session_state.am_old_account_id)
+                    source_roles = sorted(
+                        source_roles,
+                        key=lambda role: (role.get("name") or role.get("_id") or "").lower(),
+                    )
+                    st.session_state.am_source_roles = source_roles
+                    st.session_state.am_source_roles_account_id = (
+                        st.session_state.am_old_account_id
+                    )
+                except Exception as error:
+                    st.session_state.am_source_roles = []
+                    st.session_state.am_source_roles_account_id = (
+                        st.session_state.am_old_account_id
+                    )
+                    st.error(f"Could not load old-account roles: {error}")
 
             roles = st.session_state.am_roles or []
             if not roles:
-                st.warning("No roles found on the destination account.")
+                st.warning(
+                    "No roles found on the destination account. "
+                    "Recreate one from the old account below, then select it."
+                )
                 role_ids = []
                 role_labels = {}
             else:
@@ -767,11 +817,105 @@ def account_move_page():
                 st.session_state.am_role_group_id = ""
                 st.session_state.am_role_name = None
 
+            source_roles = st.session_state.am_source_roles or []
+            recreateable = [
+                role
+                for role in source_roles
+                if role.get("_id") and (role.get("name") or role.get("template"))
+            ]
+            with st.expander("Role missing? Recreate from old account", expanded=not role_ids):
+                st.caption(
+                    "Pick a role from the old account. If the destination already has the "
+                    "same name, we select that one — we never create a second copy."
+                )
+                if not recreateable:
+                    st.info("No roles found on the old account to recreate.")
+                else:
+                    source_ids = [role.get("_id") for role in recreateable]
+                    source_labels = {
+                        role.get("_id"): (
+                            f"{role.get('name') or role.get('_id')}"
+                            + (" (template)" if role.get("template") else "")
+                        )
+                        for role in recreateable
+                    }
+                    source_by_id = {role.get("_id"): role for role in recreateable}
+                    recreate_source_id = st.selectbox(
+                        "Old-account role to recreate",
+                        options=source_ids,
+                        format_func=lambda role_id: (
+                            f"{source_labels.get(role_id, role_id)} ({role_id})"
+                        ),
+                        key="am_recreate_source_role",
+                    )
+                    if st.button(
+                        "Recreate / reuse on destination",
+                        use_container_width=True,
+                        key="am_recreate_role_btn",
+                    ):
+                        try:
+                            source_role = source_by_id.get(recreate_source_id)
+                            with st.spinner("Ensuring destination role…"):
+                                dest_role, action = ensure_destination_role_from_source(
+                                    source_role,
+                                    st.session_state.am_new_account_id,
+                                    destination_roles=st.session_state.am_roles or [],
+                                )
+                            # Refresh destination role list so the selectbox includes it.
+                            refreshed = list_all_roles(st.session_state.am_new_account_id)
+                            refreshed = sorted(
+                                refreshed,
+                                key=lambda role: (
+                                    role.get("name") or role.get("_id") or ""
+                                ).lower(),
+                            )
+                            # Ensure the returned role is present even if list lags.
+                            if dest_role.get("_id") and not any(
+                                role.get("_id") == dest_role.get("_id") for role in refreshed
+                            ):
+                                refreshed = [dest_role] + refreshed
+                            st.session_state.am_roles = refreshed
+                            st.session_state.am_roles_account_id = (
+                                st.session_state.am_new_account_id
+                            )
+                            st.session_state.am_role_group_id = dest_role.get("_id")
+                            st.session_state.am_role_name = (
+                                dest_role.get("name") or dest_role.get("_id")
+                            )
+                            track_event(
+                                "account_move_role_recreated",
+                                action="account_move",
+                                role_action=action,
+                                source_role_id=recreate_source_id,
+                                destination_role_id=dest_role.get("_id"),
+                                role_name=st.session_state.am_role_name,
+                            )
+                            if action == "created":
+                                st.success(
+                                    f"Created **{st.session_state.am_role_name}** on the "
+                                    "destination account and selected it."
+                                )
+                            elif action == "already_exists":
+                                st.info(
+                                    f"**{st.session_state.am_role_name}** already exists on "
+                                    "the destination — selected it (no duplicate created)."
+                                )
+                            else:
+                                st.info(
+                                    f"Using template role **{st.session_state.am_role_name}** "
+                                    "(global — not recreated)."
+                                )
+                            st.rerun()
+                        except AccountMoveGuardrailError as error:
+                            st.error(str(error))
+                        except Exception as error:
+                            st.error(f"Could not recreate role: {error}")
+
         accounts_ready = bool(
             accounts_match_ok and st.session_state.am_role_group_id
         )
         if accounts_match_ok and not st.session_state.am_role_group_id:
-            st.caption("Select a destination role to continue.")
+            st.caption("Select a destination role (or recreate one) to continue.")
 
         if not st.session_state.am_accounts_confirmed:
             if st.button(

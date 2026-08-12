@@ -205,3 +205,33 @@ def list_all_roles(account_id: str) -> List[Dict]:
         page += 1
 
     return roles
+
+
+def get_role(role_id: str) -> Tuple[Dict, int]:
+    response = _request("GET", f"roles/{role_id}")
+    return response.json(), response.status_code
+
+
+def create_role(payload: Dict) -> Tuple[Dict, int]:
+    """Create a role on an account. Payload needs account, name, permissions."""
+    response = _request("POST", "roles", payload=payload)
+    return response.json(), response.status_code
+
+
+def build_role_duplicate_payload(source_role: Dict, destination_account_id: str) -> Dict:
+    """Build a POST /roles body that copies name/description/permissions onto dest."""
+    name = (source_role.get("name") or "").strip()
+    if not name:
+        raise ValueError("Source role has no name; cannot recreate.")
+    permissions = source_role.get("permissions")
+    if not isinstance(permissions, list):
+        raise ValueError(f"Source role '{name}' has no permissions list; cannot recreate.")
+    payload: Dict = {
+        "account": destination_account_id,
+        "name": name,
+        "permissions": list(permissions),
+    }
+    description = source_role.get("description")
+    if description:
+        payload["description"] = description
+    return payload
