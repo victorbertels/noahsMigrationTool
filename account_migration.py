@@ -1,3 +1,4 @@
+import copy
 import io
 import json
 import re
@@ -757,9 +758,16 @@ def _move_single_location(
 
         cl_label = channel_link.get("name") or channel_link_id
         _progress(f"{original_name}: moving {cl_label}…")
+        cl_payload = {
+            "account": destination_account_id,
+            "location": destination_id,
+            "posSettings": copy.deepcopy(current_destination.get("posSettings") or {}),
+        }
+        if "posSystemId" in current_destination:
+            cl_payload["posSystemId"] = current_destination["posSystemId"]
         response_data, response_status = patch_channel_link(
             channel_link_id,
-            {"account": destination_account_id, "location": destination_id},
+            cl_payload,
             channel_link.get("_etag"),
         )
         ok = 200 <= response_status < 300
@@ -772,7 +780,8 @@ def _move_single_location(
                 "name": channel_link.get("name"),
                 "action": (
                     f"Moved channel link {cl_label} "
-                    f"from {original_name} → {destination_name}."
+                    f"from {original_name} → {destination_name} "
+                    f"(posSettings + posSystemId from destination)."
                 ),
                 "status": response_status,
                 "ok": ok,
