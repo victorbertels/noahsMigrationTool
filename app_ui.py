@@ -759,7 +759,13 @@ def summarize_account_move_locations(
                 {
                     "Status": "🟢" if result.get("ok") else "🔴",
                     "Detail": result.get("action") or "",
-                    "PLUs": result.get("plu_count", ""),
+                    "PLU": (
+                        (result.get("missing_plus") or result.get("plus") or [""])[0]
+                        if not result.get("ok")
+                        and len(result.get("missing_plus") or result.get("plus") or [])
+                        == 1
+                        else result.get("plu_count", "")
+                    ),
                     "HTTP": result.get("status", ""),
                 }
             )
@@ -943,13 +949,29 @@ def show_account_move_results(
             for failure in row["_bucket"]["failures"]
         ]
         for failure in failures:
+            label = failure.get("name") or failure.get("id") or "unknown"
+            if failure.get("type") == "snooze":
+                missing = failure.get("missing_plus") or failure.get("plus") or []
+                if len(missing) == 1:
+                    label = f"PLU `{missing[0]}`"
+                elif missing:
+                    label = f"{len(missing)} PLU(s)"
             with st.expander(
-                f"Error details · {failure.get('name') or failure.get('id')}",
+                f"Error details · {label}",
                 expanded=False,
             ):
+                if failure.get("action"):
+                    st.write(failure["action"])
+                missing = failure.get("missing_plus") or (
+                    failure.get("plus") if failure.get("type") == "snooze" else None
+                )
+                if missing:
+                    st.markdown("**PLU(s) not snoozed / not found**")
+                    st.code("\n".join(str(plu) for plu in missing))
                 if failure.get("response"):
+                    st.markdown("**API response**")
                     st.json(failure["response"])
-                else:
+                elif not missing:
                     st.write(failure)
 
 

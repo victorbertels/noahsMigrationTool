@@ -464,29 +464,102 @@ def copy_snoozes_to_destination(
             ok = 200 <= status < 300
             if ok:
                 uploaded += len(batch)
-            results.append(
-                {
-                    "type": "snooze",
-                    "id": destination_location_id,
-                    "name": destination_name,
-                    "action": (
-                        f"Snoozed {len(batch)} PLU(s) on {destination_name} "
-                        f"until {end}."
-                        if ok
-                        else (
-                            f"Failed to snooze {len(batch)} PLU(s) on "
-                            f"{destination_name} (HTTP {status})."
-                        )
-                    ),
-                    "status": status,
-                    "ok": ok,
-                    "plu_count": len(batch),
-                    "plus": batch,
-                    "response": response_data,
-                    "dry_run": False,
-                    **meta,
-                }
+                results.append(
+                    {
+                        "type": "snooze",
+                        "id": destination_location_id,
+                        "name": destination_name,
+                        "action": (
+                            f"Snoozed {len(batch)} PLU(s) on {destination_name} "
+                            f"until {end}."
+                        ),
+                        "status": status,
+                        "ok": True,
+                        "plu_count": len(batch),
+                        "plus": batch,
+                        "response": response_data,
+                        "dry_run": False,
+                        **meta,
+                    }
+                )
+                continue
+
+            # Batch failed — retry one PLU at a time so Error details can name the miss.
+            if len(batch) == 1:
+                plu = batch[0]
+                results.append(
+                    {
+                        "type": "snooze",
+                        "id": destination_location_id,
+                        "name": destination_name,
+                        "action": (
+                            f"Failed to snooze PLU `{plu}` on {destination_name} "
+                            f"(HTTP {status})."
+                        ),
+                        "status": status,
+                        "ok": False,
+                        "plu_count": 1,
+                        "plus": batch,
+                        "missing_plus": batch,
+                        "response": response_data,
+                        "dry_run": False,
+                        **meta,
+                    }
+                )
+                continue
+
+            _progress(
+                f"{original_name}: batch failed (HTTP {status}) — "
+                f"checking {len(batch)} PLU(s) individually…"
             )
+            for plu in batch:
+                plu_response, plu_status = snooze_by_plus(
+                    destination_account_id,
+                    destination_location_id,
+                    [plu],
+                    start,
+                    end,
+                )
+                plu_ok = 200 <= plu_status < 300
+                if plu_ok:
+                    uploaded += 1
+                    results.append(
+                        {
+                            "type": "snooze",
+                            "id": destination_location_id,
+                            "name": destination_name,
+                            "action": (
+                                f"Snoozed PLU `{plu}` on {destination_name} until {end}."
+                            ),
+                            "status": plu_status,
+                            "ok": True,
+                            "plu_count": 1,
+                            "plus": [plu],
+                            "response": plu_response,
+                            "dry_run": False,
+                            **meta,
+                        }
+                    )
+                else:
+                    results.append(
+                        {
+                            "type": "snooze",
+                            "id": destination_location_id,
+                            "name": destination_name,
+                            "action": (
+                                f"Failed to snooze PLU `{plu}` on {destination_name} "
+                                f"(HTTP {plu_status})."
+                            ),
+                            "status": plu_status,
+                            "ok": False,
+                            "plu_count": 1,
+                            "plus": [plu],
+                            "missing_plus": [plu],
+                            "response": plu_response,
+                            "dry_run": False,
+                            **meta,
+                        }
+                    )
 
     if results and all(item.get("ok") for item in results):
         # Replace per-batch noise with one summary success when everything worked.
