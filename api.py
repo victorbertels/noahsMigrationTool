@@ -8,9 +8,10 @@ import requests
 from auth import getHeaders
 
 # Module version marker for deploy debugging (must include get_user).
-API_MODULE_VERSION = "2026-08-12-snooze-by-plus"
+API_MODULE_VERSION = "2026-08-12-busy-logout-prep"
 
 BASE_URL = "https://api.deliverect.io"
+PICKER_BASE_URL = "https://picker-backend.deliverect.com"
 
 PUT_RESTRICTED_KEYS = {
     "_id",
@@ -299,6 +300,50 @@ def snooze_by_plus(
         "snoozeEnd": snooze_end,
     }
     response = _request("POST", "products/snoozeByPlus", payload=payload)
+    try:
+        data = response.json()
+    except ValueError:
+        data = {"raw": response.text}
+    return data, response.status_code
+
+
+def set_busy_mode(
+    location_id: str,
+    preparation_time_delay: int = 999,
+) -> Tuple[Dict, int]:
+    """POST /location/{id}/busymode — close a site (high prep delay)."""
+    payload = {
+        "locationId": location_id,
+        "preparationTimeDelay": preparation_time_delay,
+    }
+    response = _request("POST", f"location/{location_id}/busymode", payload=payload)
+    try:
+        data = response.json()
+    except ValueError:
+        data = {"raw": response.text}
+    return data, response.status_code
+
+
+def logout_picker(
+    account_id: str,
+    picker_id: str,
+    access_token: str,
+) -> Tuple[Dict, int]:
+    """POST picker-backend logout using a user/portal token (not M2M)."""
+    token = (access_token or "").strip()
+    if token.lower().startswith("bearer "):
+        token = token[7:].strip()
+    if not token:
+        return {"error": "Missing picker logout token"}, 401
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+    url = (
+        f"{PICKER_BASE_URL}/portal/accounts/{account_id}/pickers/{picker_id}/logout"
+    )
+    response = requests.request("POST", url, headers=headers, json={})
     try:
         data = response.json()
     except ValueError:

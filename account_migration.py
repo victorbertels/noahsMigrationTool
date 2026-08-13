@@ -17,11 +17,13 @@ from api import (
     list_all_locations,
     list_all_roles,
     list_all_users,
+    logout_picker,
     patch_channel_link,
     patch_location,
     patch_user,
     prepare_put_payload,
     put_channel_link,
+    set_busy_mode,
     snooze_by_plus,
 )
 
@@ -33,6 +35,9 @@ RETAINED_TEST_CHANNEL_NAME = "Test Channel"
 
 # Batch size for POST /products/snoozeByPlus
 SNOOZE_PLUS_BATCH_SIZE = 100
+
+# Temporarily muted — picker-backend logout needs a user/portal token, not M2M.
+FORCE_PICKER_LOGOUT_ENABLED = False
 
 
 class AccountMoveGuardrailError(Exception):
@@ -173,6 +178,7 @@ def resolve_or_duplicate_destination_role(
     source_roles_by_id: dict[str, dict],
     fallback_role_id: Optional[str] = None,
     created_by_source_role_id: Optional[dict[str, str]] = None,
+    dry_run: bool = False,
 ) -> tuple[str, str]:
     """Pick a destination role for a Quest user.
 
@@ -216,6 +222,20 @@ def resolve_or_duplicate_destination_role(
             if fallback_role_id:
                 return str(fallback_role_id), f"fallback ({error})"
             raise AccountMoveGuardrailError(str(error)) from error
+
+        if dry_run:
+            dest_id = f"dry-run-new-role:{source_id or name_key or 'unknown'}"
+            stub = {
+                "_id": dest_id,
+                "name": source_role.get("name"),
+                "account": destination_account_id,
+            }
+            destination_roles_by_id[dest_id] = stub
+            if name_key:
+                destination_roles_by_name[name_key] = stub
+            if source_id:
+                cache[source_id] = dest_id
+            return dest_id, f"would duplicate '{source_role.get('name')}' onto destination"
 
         created, status = create_role(payload)
         if 200 <= status < 300 and isinstance(created, dict) and created.get("_id"):
@@ -345,11 +365,13 @@ def copy_snoozes_to_destination(
     destination_location_id: str,
     location_meta: Optional[dict] = None,
     on_progress=None,
+    dry_run: bool = False,
 ) -> list[dict]:
     """Copy active snoozes from original location onto destination via snoozeByPlus."""
     meta = location_meta or {}
     original_name = meta.get("original_location_name") or original_location_id
     destination_name = meta.get("destination_location_name") or destination_location_id
+    dry_prefix = "[DRY RUN] Would " if dry_run else ""
 
     def _progress(message: str):
         if on_progress:
@@ -368,6 +390,7 @@ def copy_snoozes_to_destination(
                 "status": 0,
                 "ok": False,
                 "plu_count": 0,
+                "dry_run": dry_run,
                 **meta,
             }
         ]
@@ -383,6 +406,7 @@ def copy_snoozes_to_destination(
                 "status": 200,
                 "ok": True,
                 "plu_count": 0,
+                "dry_run": dry_run,
                 **meta,
             }
         ]
@@ -398,8 +422,30 @@ def copy_snoozes_to_destination(
         plu = (item.get("plu") or "").strip()
         groups.setdefault((start, end), []).append(plu)
 
-    results = []
     total_plus = sum(len(plus) for plus in groups.values())
+    if dry_run:
+        _progress(
+            f"{original_name}: dry run — would upload {total_plus} snoozed PLU(s) "
+            f"to {destination_name}…"
+        )
+        return [
+            {
+                "type": "snooze",
+                "id": destination_location_id,
+                "name": destination_name,
+                "action": (
+                    f"{dry_prefix}copy {total_plus} snoozed PLU(s) from {original_name} "
+                    f"→ {destination_name} via snoozeByPlus."
+                ),
+                "status": 200,
+                "ok": True,
+                "plu_count": total_plus,
+                "dry_run": True,
+                **meta,
+            }
+        ]
+
+    results = []
     uploaded = 0
     _progress(
         f"{original_name}: uploading {total_plus} snoozed PLU(s) to {destination_name}…"
@@ -437,6 +483,7 @@ def copy_snoozes_to_destination(
                     "plu_count": len(batch),
                     "plus": batch,
                     "response": response_data,
+                    "dry_run": False,
                     **meta,
                 }
             )
@@ -455,10 +502,171 @@ def copy_snoozes_to_destination(
                 "status": 200,
                 "ok": True,
                 "plu_count": uploaded,
+                "dry_run": False,
                 **meta,
             }
         ]
 
+    return results
+
+
+def close_sites_busy_mode(
+    location_ids: list[tuple[str, str]],
+    location_meta: Optional[dict] = None,
+    on_progress=None,
+    preparation_time_delay: int = 999,
+    dry_run: bool = False,
+) -> list[dict]:
+    """Set busy mode on the given (location_id, display_name) pairs before a move."""
+    meta = location_meta or {}
+    results = []
+    dry_prefix = "[DRY RUN] Would " if dry_run else ""
+
+    def _progress(message: str):
+        if on_progress:
+            on_progress(message)
+
+    for location_id, display_name in location_ids:
+        label = display_name or location_id
+        if dry_run:
+            _progress(f"Dry run: would close {label} (busy mode)…")
+            results.append(
+                {
+                    "type": "busy",
+                    "id": location_id,
+                    "name": label,
+                    "action": (
+                        f"{dry_prefix}set busy mode on {label} "
+                        f"(preparationTimeDelay={preparation_time_delay})."
+                    ),
+                    "status": 200,
+                    "ok": True,
+                    "dry_run": True,
+                    **meta,
+                }
+            )
+            continue
+
+        _progress(f"Closing {label} (busy mode)…")
+        response_data, status = set_busy_mode(
+            location_id,
+            preparation_time_delay=preparation_time_delay,
+        )
+        ok = 200 <= status < 300
+        results.append(
+            {
+                "type": "busy",
+                "id": location_id,
+                "name": label,
+                "action": (
+                    f"Set busy mode on {label} "
+                    f"(preparationTimeDelay={preparation_time_delay})."
+                    if ok
+                    else f"Failed to set busy mode on {label} (HTTP {status})."
+                ),
+                "status": status,
+                "ok": ok,
+                "response": response_data,
+                "dry_run": False,
+                **meta,
+            }
+        )
+    return results
+
+
+def logout_quest_users(
+    account_id: str,
+    users: list[dict],
+    location_meta: Optional[dict] = None,
+    on_progress=None,
+    dry_run: bool = False,
+    picker_logout_token: Optional[str] = None,
+) -> list[dict]:
+    """Logout Quest pickers on the original account before moving them."""
+    meta = location_meta or {}
+    results = []
+    dry_prefix = "[DRY RUN] Would " if dry_run else ""
+    token = (picker_logout_token or "").strip()
+
+    def _progress(message: str):
+        if on_progress:
+            on_progress(message)
+
+    if not users:
+        return []
+
+    if not FORCE_PICKER_LOGOUT_ENABLED:
+        _progress("Picker force logout muted — skipping.")
+        return [
+            {
+                "type": "logout",
+                "id": meta.get("original_location_id") or account_id,
+                "name": meta.get("original_location_name") or account_id,
+                "action": "Picker force logout muted — skipped.",
+                "status": 200,
+                "ok": True,
+                "dry_run": dry_run,
+                **meta,
+            }
+        ]
+
+    if not dry_run and not token:
+        return [
+            {
+                "type": "logout",
+                "id": user.get("_id"),
+                "name": user.get("name") or user.get("email") or user.get("_id"),
+                "action": (
+                    "Skipped logout — paste a user/portal token "
+                    "(not the machine-to-machine token) in the picker logout field."
+                ),
+                "status": 401,
+                "ok": False,
+                "dry_run": False,
+                **meta,
+            }
+            for user in users
+        ]
+
+    for user in users:
+        user_id = user["_id"]
+        user_label = user.get("name") or user.get("email") or user_id
+        if dry_run:
+            _progress(f"Dry run: would logout {user_label}…")
+            results.append(
+                {
+                    "type": "logout",
+                    "id": user_id,
+                    "name": user_label,
+                    "action": f"{dry_prefix}logout picker {user_label}.",
+                    "status": 200,
+                    "ok": True,
+                    "dry_run": True,
+                    **meta,
+                }
+            )
+            continue
+
+        _progress(f"Logging out {user_label}…")
+        response_data, status = logout_picker(account_id, user_id, token)
+        ok = 200 <= status < 300
+        results.append(
+            {
+                "type": "logout",
+                "id": user_id,
+                "name": user_label,
+                "action": (
+                    f"Logged out picker {user_label}."
+                    if ok
+                    else f"Failed to logout picker {user_label} (HTTP {status})."
+                ),
+                "status": status,
+                "ok": ok,
+                "response": response_data,
+                "dry_run": False,
+                **meta,
+            }
+        )
     return results
 
 
@@ -809,6 +1017,8 @@ def _move_single_location(
     source_roles_by_id: Optional[dict[str, dict]] = None,
     created_roles_by_source_id: Optional[dict[str, str]] = None,
     on_progress=None,
+    dry_run: bool = False,
+    picker_logout_token: Optional[str] = None,
 ) -> list[dict]:
     results = []
     original_id = original["_id"]
@@ -816,6 +1026,7 @@ def _move_single_location(
     original_name = original.get("name", original_id)
     destination_name = destination.get("name", destination_id)
     retained_channel_link_ids = list(retained_channel_link_ids or [])
+    dry_prefix = "[DRY RUN] Would " if dry_run else ""
     location_meta = {
         "original_location_id": original_id,
         "original_location_name": original_name,
@@ -851,6 +1062,7 @@ def _move_single_location(
                 "action": f"Failed to refresh original location {original_name}",
                 "status": original_status,
                 "ok": False,
+                "dry_run": dry_run,
                 **location_meta,
             }
         )
@@ -866,6 +1078,7 @@ def _move_single_location(
                 "action": f"Failed to refresh destination location {destination_name}",
                 "status": destination_status,
                 "ok": False,
+                "dry_run": dry_run,
                 **location_meta,
             }
         )
@@ -874,6 +1087,40 @@ def _move_single_location(
     validate_location_belongs(current_original, original_account_id, "Original location")
     validate_location_belongs(
         current_destination, destination_account_id, "Destination location"
+    )
+
+    # Prep before the live move: close sites, logout pickers, copy snoozes.
+    results.extend(
+        close_sites_busy_mode(
+            [
+                (original_id, original_name),
+                (destination_id, destination_name),
+            ],
+            location_meta=location_meta,
+            on_progress=_progress,
+            dry_run=dry_run,
+        )
+    )
+    results.extend(
+        logout_quest_users(
+            original_account_id,
+            list(users or []),
+            location_meta=location_meta,
+            on_progress=_progress,
+            dry_run=dry_run,
+            picker_logout_token=picker_logout_token,
+        )
+    )
+    results.extend(
+        copy_snoozes_to_destination(
+            original_account_id,
+            original_id,
+            destination_account_id,
+            destination_id,
+            location_meta=location_meta,
+            on_progress=_progress,
+            dry_run=dry_run,
+        )
     )
 
     moved_ids = []
@@ -887,6 +1134,7 @@ def _move_single_location(
                     "status": channel_status,
                     "ok": False,
                     "action": f"Failed to fetch channel link {channel_link_id}",
+                    "dry_run": dry_run,
                     **location_meta,
                 }
             )
@@ -908,7 +1156,29 @@ def _move_single_location(
             continue
 
         cl_label = channel_link.get("name") or channel_link_id
-        _progress(f"{original_name}: moving {cl_label}…")
+        _progress(
+            f"{original_name}: {'would move' if dry_run else 'moving'} {cl_label}…"
+        )
+        if dry_run:
+            moved_ids.append(channel_link_id)
+            results.append(
+                {
+                    "type": "channel_link",
+                    "id": channel_link_id,
+                    "name": channel_link.get("name"),
+                    "action": (
+                        f"{dry_prefix}move channel link {cl_label} "
+                        f"from {original_name} → {destination_name} "
+                        f"(posSettings + posSystemId from destination)."
+                    ),
+                    "status": 200,
+                    "ok": True,
+                    "dry_run": True,
+                    **location_meta,
+                }
+            )
+            continue
+
         cl_payload = {
             "account": destination_account_id,
             "location": destination_id,
@@ -937,6 +1207,7 @@ def _move_single_location(
                 "status": response_status,
                 "ok": ok,
                 "response": response_data,
+                "dry_run": False,
                 **location_meta,
             }
         )
@@ -954,76 +1225,120 @@ def _move_single_location(
         )
         return results
 
-    _progress(f"{original_name}: updating original location…")
     new_name = apply_migrated_marker(current_original.get("name", ""), destination_id)
-    original_payload = {"channelLinks": retained_channel_link_ids, "name": new_name}
-    original_response, original_patch_status = patch_location(
-        original_id,
-        original_payload,
-        current_original.get("_etag"),
-    )
     retained_note = (
         f" Kept {len(retained_channel_link_ids)} Test Channel link(s) on original."
         if retained_channel_link_ids
         else ""
     )
-    results.append(
-        {
-            "type": "location",
-            "id": original_id,
-            "name": new_name,
-            "role": "original",
-            "action": (
-                f"Updated {original_name}: moved channel links away, renamed with "
-                f"{migrated_marker(destination_id)}."
-                f"{retained_note}"
-            ),
-            "status": original_patch_status,
-            "ok": 200 <= original_patch_status < 300,
-            "response": original_response,
-            **location_meta,
-        }
+    _progress(
+        f"{original_name}: {'would update' if dry_run else 'updating'} original location…"
     )
+    if dry_run:
+        results.append(
+            {
+                "type": "location",
+                "id": original_id,
+                "name": new_name,
+                "role": "original",
+                "action": (
+                    f"{dry_prefix}update {original_name}: move channel links away, rename with "
+                    f"{migrated_marker(destination_id)}."
+                    f"{retained_note}"
+                ),
+                "status": 200,
+                "ok": True,
+                "dry_run": True,
+                **location_meta,
+            }
+        )
+    else:
+        original_payload = {"channelLinks": retained_channel_link_ids, "name": new_name}
+        original_response, original_patch_status = patch_location(
+            original_id,
+            original_payload,
+            current_original.get("_etag"),
+        )
+        results.append(
+            {
+                "type": "location",
+                "id": original_id,
+                "name": new_name,
+                "role": "original",
+                "action": (
+                    f"Updated {original_name}: moved channel links away, renamed with "
+                    f"{migrated_marker(destination_id)}."
+                    f"{retained_note}"
+                ),
+                "status": original_patch_status,
+                "ok": 200 <= original_patch_status < 300,
+                "response": original_response,
+                "dry_run": False,
+                **location_meta,
+            }
+        )
 
     destination_links = list(current_destination.get("channelLinks") or [])
     for channel_link_id in moved_ids:
         if channel_link_id not in destination_links:
             destination_links.append(channel_link_id)
 
-    _progress(f"{original_name}: updating destination {destination_name}…")
-    refreshed_destination, refreshed_status = get_location(destination_id)
-    destination_etag = (
-        refreshed_destination.get("_etag")
-        if refreshed_status == 200
-        else current_destination.get("_etag")
+    _progress(
+        f"{original_name}: {'would update' if dry_run else 'updating'} "
+        f"destination {destination_name}…"
     )
-    if refreshed_status == 200:
-        destination_links = list(refreshed_destination.get("channelLinks") or [])
-        for channel_link_id in moved_ids:
-            if channel_link_id not in destination_links:
-                destination_links.append(channel_link_id)
+    if dry_run:
+        results.append(
+            {
+                "type": "location",
+                "id": destination_id,
+                "name": destination_name,
+                "role": "destination",
+                "action": (
+                    f"{dry_prefix}update destination {destination_name} with "
+                    f"{len(destination_links)} channel link(s)."
+                ),
+                "status": 200,
+                "ok": True,
+                "dry_run": True,
+                **location_meta,
+            }
+        )
+    else:
+        refreshed_destination, refreshed_status = get_location(destination_id)
+        destination_etag = (
+            refreshed_destination.get("_etag")
+            if refreshed_status == 200
+            else current_destination.get("_etag")
+        )
+        if refreshed_status == 200:
+            destination_links = list(refreshed_destination.get("channelLinks") or [])
+            for channel_link_id in moved_ids:
+                if channel_link_id not in destination_links:
+                    destination_links.append(channel_link_id)
 
-    destination_response, destination_patch_status = patch_location(
-        destination_id,
-        {"channelLinks": destination_links},
-        destination_etag,
-    )
-    results.append(
-        {
-            "type": "location",
-            "id": destination_id,
-            "name": destination_name,
-            "role": "destination",
-            "action": (
-                f"Updated destination {destination_name} with "
-                f"{len(destination_links)} channel link(s)."
-            ),
-            "status": destination_patch_status,
-            "ok": 200 <= destination_patch_status < 300,
-            "response": destination_response,
-            **location_meta,
-        }
-    )
+        destination_response, destination_patch_status = patch_location(
+            destination_id,
+            {"channelLinks": destination_links},
+            destination_etag,
+        )
+        results.append(
+            {
+                "type": "location",
+                "id": destination_id,
+                "name": destination_name,
+                "role": "destination",
+                "action": (
+                    f"Updated destination {destination_name} with "
+                    f"{len(destination_links)} channel link(s)."
+                ),
+                "status": destination_patch_status,
+                "ok": 200 <= destination_patch_status < 300,
+                "response": destination_response,
+                "dry_run": False,
+                **location_meta,
+            }
+        )
 
     quest_users = list(users or [])
     if quest_users:
@@ -1046,7 +1361,10 @@ def _move_single_location(
         for user in quest_users:
             user_id = user["_id"]
             user_label = user.get("name") or user.get("email") or user_id
-            _progress(f"{original_name}: moving user {user_label}…")
+            _progress(
+                f"{original_name}: {'would move' if dry_run else 'moving'} "
+                f"user {user_label}…"
+            )
             current_user, user_status = get_user(user_id)
             if user_status != 200:
                 results.append(
@@ -1057,6 +1375,7 @@ def _move_single_location(
                         "action": f"Failed to fetch user {user_label}",
                         "status": user_status,
                         "ok": False,
+                        "dry_run": dry_run,
                         **location_meta,
                     }
                 )
@@ -1098,6 +1417,7 @@ def _move_single_location(
                     source_by_id,
                     fallback_role_id=role_group_id,
                     created_by_source_role_id=created_cache,
+                    dry_run=dry_run,
                 )
             except AccountMoveGuardrailError as error:
                 results.append(
@@ -1110,6 +1430,26 @@ def _move_single_location(
                         ),
                         "status": None,
                         "ok": False,
+                        "dry_run": dry_run,
+                        **location_meta,
+                    }
+                )
+                continue
+
+            if dry_run:
+                results.append(
+                    {
+                        "type": "user",
+                        "id": user_id,
+                        "name": user_label,
+                        "action": (
+                            f"{dry_prefix}move user {user_label} to destination account / "
+                            f"{destination_name} with role {resolved_role_id} "
+                            f"({resolution})."
+                        ),
+                        "status": 200,
+                        "ok": True,
+                        "dry_run": True,
                         **location_meta,
                     }
                 )
@@ -1138,6 +1478,7 @@ def _move_single_location(
                     "status": user_patch_status,
                     "ok": 200 <= user_patch_status < 300,
                     "response": user_response,
+                    "dry_run": False,
                     **location_meta,
                 }
             )
@@ -1152,17 +1493,6 @@ def _move_single_location(
             }
         )
 
-    results.extend(
-        copy_snoozes_to_destination(
-            original_account_id,
-            original_id,
-            destination_account_id,
-            destination_id,
-            location_meta=location_meta,
-            on_progress=_progress,
-        )
-    )
-
     return results
 
 
@@ -1172,6 +1502,8 @@ def run_account_move(
     destination_account_id: str,
     role_group_id: str,
     on_progress=None,
+    dry_run: bool = False,
+    picker_logout_token: Optional[str] = None,
 ) -> list[dict]:
     _require_accounts(original_account_id, destination_account_id)
     # Fallback role is optional — we match/duplicate each Quest user's current role.
@@ -1272,6 +1604,8 @@ def run_account_move(
                 source_roles_by_id=source_roles_by_id,
                 created_roles_by_source_id=created_roles_by_source_id,
                 on_progress=_location_progress,
+                dry_run=dry_run,
+                picker_logout_token=picker_logout_token,
             )
         )
         step += 1

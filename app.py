@@ -8,6 +8,7 @@ st.set_page_config(
 
 from account_migration import (
     AccountMoveGuardrailError,
+    FORCE_PICKER_LOGOUT_ENABLED,
     classify_account_locations,
     create_account_move_backup_zip,
     fetch_move_snapshot,
@@ -229,8 +230,13 @@ def _run_account_move_with_progress(
     original_account_id: str,
     destination_account_id: str,
     role_group_id: str,
+    dry_run: bool = False,
+    picker_logout_token: str = "",
 ) -> list[dict]:
-    progress = st.progress(0.0, text="Starting account move…")
+    progress = st.progress(
+        0.0,
+        text="Starting dry run…" if dry_run else "Starting account move…",
+    )
     status = st.empty()
 
     def on_progress(fraction: float, message: str):
@@ -243,6 +249,8 @@ def _run_account_move_with_progress(
         destination_account_id,
         role_group_id,
         on_progress=on_progress,
+        dry_run=dry_run,
+        picker_logout_token=picker_logout_token,
     )
     progress.progress(1.0, text="Finished")
     status.caption("Finished")
@@ -424,40 +432,94 @@ def _account_move_per_location(
     if st.session_state.am_confirmed and st.session_state.am_backup_downloaded:
         with st.container(border=True):
             step_heading("Run account move", "5")
+            st.info(
+                "Dry run reads current state and lists every write that would happen "
+                "(busy mode, logout, snoozes, channel links, locations, users) — no POSTs/PATCHes."
+            )
             st.warning(
-                "This is the live move. Channel links, location names, and Quest users "
-                "will be updated on Deliverect."
+                "Run account move is live: busy mode, snooze copy, then channel links / "
+                "locations / Quest users are updated on Deliverect."
             )
             st.caption(
-                "Moves channel links to the destination account/location, clears them on the "
-                "original (except Test Channel), appends `#MIGRATEDTO{destinationId}#` to the "
-                "original name, assigns each Quest user a matched or duplicated role, and copies "
-                "active snoozed PLUs onto the destination via snoozeByPlus."
+                "Prep: closes original + destination via busy mode"
+                + (
+                    ", logs out Quest pickers"
+                    if FORCE_PICKER_LOGOUT_ENABLED
+                    else " (picker force logout muted)"
+                )
+                + ", and copies active snoozed PLUs to the destination. Then moves channel links, "
+                "clears them on the original (except Test Channel), appends "
+                "`#MIGRATEDTO{destinationId}#` to the original name, and assigns each Quest "
+                "user a matched or duplicated role."
             )
-            if st.button("Run account move", type="primary", use_container_width=True, key="am_run"):
-                try:
-                    results = _run_account_move_with_progress(
-                        [st.session_state.am_location_id],
-                        original_account_id,
-                        destination_account_id,
-                        role_group_id,
+            picker_logout_token = ""
+            if FORCE_PICKER_LOGOUT_ENABLED:
+                picker_logout_token = st.text_input(
+                    "Picker logout token",
+                    type="password",
+                    placeholder="Paste a user/portal Bearer token (not M2M)",
+                    help=(
+                        "Used only for picker-backend force logout. Machine-to-machine tokens "
+                        "are rejected by that API. Optional for dry run; required for live logout."
+                    ),
+                    key="am_picker_logout_token",
+                )
+            dry_col, live_col = st.columns(2)
+            with dry_col:
+                run_dry = st.button(
+                    "Dry run",
+                    use_container_width=True,
+                    key="am_dry_run",
+                )
+            with live_col:
+                run_live = st.button(
+                    "Run account move",
+                    type="primary",
+                    use_container_width=True,
+                    key="am_run",
+                )
+            if run_dry or run_live:
+                dry_run = bool(run_dry)
+                if (
+                    FORCE_PICKER_LOGOUT_ENABLED
+                    and not dry_run
+                    and not (picker_logout_token or "").strip()
+                ):
+                    st.error(
+                        "Paste a user/portal token in Picker logout token before the live move "
+                        "(M2M tokens do not work for force logout)."
                     )
-                    track_event(
-                        "account_move_run",
-                        action="account_move",
-                        mode="per_location",
-                        location_id=st.session_state.am_location_id,
-                        success=all(
-                            result.get("ok", True)
-                            for result in results
-                            if result.get("type") != "warning"
-                        ),
-                    )
-                    show_account_move_results(results)
-                except AccountMoveGuardrailError as error:
-                    st.error(str(error))
-                except Exception as error:
-                    st.error(str(error))
+                else:
+                    try:
+                        results = _run_account_move_with_progress(
+                            [st.session_state.am_location_id],
+                            original_account_id,
+                            destination_account_id,
+                            role_group_id,
+                            dry_run=dry_run,
+                            picker_logout_token=picker_logout_token,
+                        )
+                        track_event(
+                            "account_move_dry_run" if dry_run else "account_move_run",
+                            action="account_move",
+                            mode="per_location",
+                            dry_run=dry_run,
+                            location_id=st.session_state.am_location_id,
+                            success=all(
+                                result.get("ok", True)
+                                for result in results
+                                if result.get("type") != "warning"
+                            ),
+                        )
+                        show_account_move_results(
+                            results,
+                            title="Dry run overview" if dry_run else "Location overview",
+                            success_label="Would migrate" if dry_run else "Fully migrated",
+                        )
+                    except AccountMoveGuardrailError as error:
+                        st.error(str(error))
+                    except Exception as error:
+                        st.error(str(error))
 
 
 def _account_move_rest_of_account(
@@ -649,54 +711,103 @@ def _account_move_rest_of_account(
     if st.session_state.am_backup_downloaded:
         with st.container(border=True):
             step_heading("Run account move", "5")
+            st.info(
+                "Dry run reads current state and lists every write that would happen "
+                "(busy mode, logout, snoozes, channel links, locations, users) — no POSTs/PATCHes."
+            )
             st.warning(
-                "This is the live move. Channel links, location names, and Quest users "
-                f"will be updated for {len(ready)} ready location(s)."
+                "Run account move is live: busy mode, snooze copy, then channel links / "
+                f"locations / Quest users are updated for {len(ready)} ready location(s)."
             )
             st.caption(
-                "Same as per-location: channel links move, original gets `#MIGRATEDTO…#`, "
-                "Quest users get a matched or duplicated role, and active snoozed PLUs are "
-                "copied to the destination via snoozeByPlus."
+                "Same as per-location: busy-mode close"
+                + (
+                    ", picker logout, "
+                    if FORCE_PICKER_LOGOUT_ENABLED
+                    else " (picker force logout muted), "
+                )
+                + "snooze copy, then channel links move, original gets `#MIGRATEDTO…#`, "
+                "and Quest users get a matched or duplicated role."
             )
-            if st.button(
-                "Run account move for ready locations",
-                type="primary",
-                use_container_width=True,
-                key="am_rest_run",
-            ):
-                try:
-                    location_ids = [row["original"]["_id"] for row in ready]
-                    results = _run_account_move_with_progress(
-                        location_ids,
-                        original_account_id,
-                        destination_account_id,
-                        role_group_id,
+            picker_logout_token = ""
+            if FORCE_PICKER_LOGOUT_ENABLED:
+                picker_logout_token = st.text_input(
+                    "Picker logout token",
+                    type="password",
+                    placeholder="Paste a user/portal Bearer token (not M2M)",
+                    help=(
+                        "Used only for picker-backend force logout. Machine-to-machine tokens "
+                        "are rejected by that API. Optional for dry run; required for live logout."
+                    ),
+                    key="am_picker_logout_token",
+                )
+            dry_col, live_col = st.columns(2)
+            with dry_col:
+                run_dry = st.button(
+                    "Dry run for ready locations",
+                    use_container_width=True,
+                    key="am_rest_dry_run",
+                )
+            with live_col:
+                run_live = st.button(
+                    "Run account move for ready locations",
+                    type="primary",
+                    use_container_width=True,
+                    key="am_rest_run",
+                )
+            if run_dry or run_live:
+                dry_run = bool(run_dry)
+                location_ids = [row["original"]["_id"] for row in ready]
+                if (
+                    FORCE_PICKER_LOGOUT_ENABLED
+                    and not dry_run
+                    and not (picker_logout_token or "").strip()
+                ):
+                    st.error(
+                        "Paste a user/portal token in Picker logout token before the live move "
+                        "(M2M tokens do not work for force logout)."
                     )
-                    track_event(
-                        "account_move_run",
-                        action="account_move",
-                        mode="rest_of_account",
-                        location_count=len(location_ids),
-                        success=all(
-                            result.get("ok", True)
-                            for result in results
-                            if result.get("type") != "warning"
-                        ),
-                    )
-                    show_account_move_results(results)
-                    # Force reload classification next time
-                    st.session_state.am_rest_loaded = False
-                except AccountMoveGuardrailError as error:
-                    st.error(str(error))
-                except Exception as error:
-                    st.error(str(error))
+                else:
+                    try:
+                        results = _run_account_move_with_progress(
+                            location_ids,
+                            original_account_id,
+                            destination_account_id,
+                            role_group_id,
+                            dry_run=dry_run,
+                            picker_logout_token=picker_logout_token,
+                        )
+                        track_event(
+                            "account_move_dry_run" if dry_run else "account_move_run",
+                            action="account_move",
+                            mode="rest_of_account",
+                            dry_run=dry_run,
+                            location_count=len(location_ids),
+                            success=all(
+                                result.get("ok", True)
+                                for result in results
+                                if result.get("type") != "warning"
+                            ),
+                        )
+                        show_account_move_results(
+                            results,
+                            title="Dry run overview" if dry_run else "Location overview",
+                            success_label="Would migrate" if dry_run else "Fully migrated",
+                        )
+                        if not dry_run:
+                            # Force reload classification next time after a live move
+                            st.session_state.am_rest_loaded = False
+                    except AccountMoveGuardrailError as error:
+                        st.error(str(error))
+                    except Exception as error:
+                        st.error(str(error))
 
 
 def account_move_page():
     wizard_steps(
         ACCOUNT_MOVE_WIZARD_STEPS,
         account_move_current_step(),
-        note="Only <strong>Run move</strong> changes live data. Steps 1–4 are setup, confirm &amp; backup.",
+        note="Only <strong>Run move</strong> changes live data. Dry run is read-only. Steps 1–4 are setup, confirm &amp; backup.",
     )
     with st.container(border=True):
         step_heading("Accounts", "1")

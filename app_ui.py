@@ -642,12 +642,20 @@ def summarize_account_move_locations(
                 "snooze_fail": 0,
                 "snooze_total": 0,
                 "snooze_plus": 0,
+                "busy_ok": 0,
+                "busy_fail": 0,
+                "busy_total": 0,
+                "logout_ok": 0,
+                "logout_fail": 0,
+                "logout_total": 0,
                 "location_ok": True,
                 "had_location_step": False,
                 "skipped": False,
                 "channel_rows": [],
                 "user_rows": [],
                 "snooze_rows": [],
+                "busy_rows": [],
+                "logout_rows": [],
                 "failures": [],
             }
 
@@ -663,9 +671,48 @@ def summarize_account_move_locations(
             if (
                 bucket["channel_total"] == 0
                 and bucket["user_total"] == 0
+                and bucket["busy_total"] == 0
+                and bucket["logout_total"] == 0
+                and bucket["snooze_total"] == 0
                 and not bucket["had_location_step"]
             ):
                 bucket["skipped"] = True
+            continue
+
+        if result.get("type") == "busy":
+            bucket["skipped"] = False
+            bucket["busy_total"] += 1
+            bucket["busy_rows"].append(
+                {
+                    "Status": "🟢" if result.get("ok") else "🔴",
+                    "Site": result.get("name") or result.get("id") or "",
+                    "Detail": result.get("action") or "",
+                    "HTTP": result.get("status", ""),
+                }
+            )
+            if result.get("ok"):
+                bucket["busy_ok"] += 1
+            else:
+                bucket["busy_fail"] += 1
+                bucket["failures"].append(result)
+            continue
+
+        if result.get("type") == "logout":
+            bucket["skipped"] = False
+            bucket["logout_total"] += 1
+            bucket["logout_rows"].append(
+                {
+                    "Status": "🟢" if result.get("ok") else "🔴",
+                    "User": result.get("name") or result.get("id") or "",
+                    "Detail": result.get("action") or "",
+                    "HTTP": result.get("status", ""),
+                }
+            )
+            if result.get("ok"):
+                bucket["logout_ok"] += 1
+            else:
+                bucket["logout_fail"] += 1
+                bucket["failures"].append(result)
             continue
 
         if result.get("type") == "channel_link":
@@ -739,9 +786,17 @@ def summarize_account_move_locations(
             and bucket["channel_fail"] == 0
             and bucket["user_fail"] == 0
             and bucket["snooze_fail"] == 0
+            and bucket["busy_fail"] == 0
+            and bucket["logout_fail"] == 0
         ):
             status, outcome = "🟢", success_label
-        elif bucket["channel_ok"] > 0 or bucket["user_ok"] > 0 or bucket["snooze_ok"] > 0:
+        elif (
+            bucket["channel_ok"] > 0
+            or bucket["user_ok"] > 0
+            or bucket["snooze_ok"] > 0
+            or bucket["busy_ok"] > 0
+            or bucket["logout_ok"] > 0
+        ):
             status, outcome = "🟠", "Partial"
         else:
             status, outcome = "🔴", "Failed"
@@ -759,6 +814,12 @@ def summarize_account_move_locations(
                 "Users": (
                     f"{bucket['user_ok']}/{bucket['user_total']}"
                     if bucket["user_total"]
+                    else "—"
+                ),
+                "Prep": (
+                    f"busy {bucket['busy_ok']}/{bucket['busy_total']}"
+                    f" · out {bucket['logout_ok']}/{bucket['logout_total']}"
+                    if bucket["busy_total"] or bucket["logout_total"]
                     else "—"
                 ),
                 "Snoozes": (
@@ -815,6 +876,7 @@ def show_account_move_results(
                     "Destination": row["Destination"],
                     "Channels": row["Channels"],
                     "Users": row["Users"],
+                    "Prep": row["Prep"],
                     "Snoozes": row["Snoozes"],
                     "Outcome": row["Outcome"],
                 }
@@ -831,12 +893,28 @@ def show_account_move_results(
                 row["_bucket"]["channel_rows"]
                 or row["_bucket"]["user_rows"]
                 or row["_bucket"]["snooze_rows"]
+                or row["_bucket"]["busy_rows"]
+                or row["_bucket"]["logout_rows"]
             )
         ]
         if detail_rows:
-            with st.expander("Per-channel / user / snooze details", expanded=False):
+            with st.expander("Per-channel / user / prep / snooze details", expanded=False):
                 for row in detail_rows:
                     st.markdown(f"**{row['Location']}**")
+                    if row["_bucket"]["busy_rows"]:
+                        st.caption("Busy mode")
+                        st.dataframe(
+                            row["_bucket"]["busy_rows"],
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+                    if row["_bucket"]["logout_rows"]:
+                        st.caption("Picker logout")
+                        st.dataframe(
+                            row["_bucket"]["logout_rows"],
+                            use_container_width=True,
+                            hide_index=True,
+                        )
                     if row["_bucket"]["channel_rows"]:
                         st.caption("Channel links")
                         st.dataframe(
