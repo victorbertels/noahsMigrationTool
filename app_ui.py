@@ -276,6 +276,7 @@ PAGE_LABELS = {
     "revert": "Quest revert",
     "account_move": "Account move",
     "account_revert": "Account revert",
+    "move_to_v2": "Move to V2",
 }
 
 
@@ -287,20 +288,27 @@ def render_nav() -> str:
     if st.session_state.active_page not in PAGE_LABELS:
         st.session_state.active_page = "migrate"
 
-    row1 = st.columns(2)
-    row2 = st.columns(2)
-    page_order = ["migrate", "revert", "account_move", "account_revert"]
-    for index, page_key in enumerate(page_order):
-        column = row1[index] if index < 2 else row2[index - 2]
-        with column:
-            if st.button(
-                PAGE_LABELS[page_key],
-                type="primary" if st.session_state.active_page == page_key else "secondary",
-                use_container_width=True,
-                key=f"nav_{page_key}",
-            ):
-                st.session_state.active_page = page_key
-                st.rerun()
+    page_order = [
+        "migrate",
+        "revert",
+        "account_move",
+        "account_revert",
+        "move_to_v2",
+    ]
+    # Lay out nav buttons in rows of 2.
+    for row_start in range(0, len(page_order), 2):
+        chunk = page_order[row_start : row_start + 2]
+        columns = st.columns(2)
+        for index, page_key in enumerate(chunk):
+            with columns[index]:
+                if st.button(
+                    PAGE_LABELS[page_key],
+                    type="primary" if st.session_state.active_page == page_key else "secondary",
+                    use_container_width=True,
+                    key=f"nav_{page_key}",
+                ):
+                    st.session_state.active_page = page_key
+                    st.rerun()
 
     st.markdown("<div style='margin-bottom: 1.2rem'></div>", unsafe_allow_html=True)
     return st.session_state.active_page
@@ -1042,6 +1050,23 @@ def init_account_revert_session_state():
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
+
+
+def init_move_to_v2_session_state():
+    defaults = {
+        "v2_account_id": "",
+        "v2_account_input": "",
+        "v2_scan": None,
+        "v2_results": None,
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+def reset_move_to_v2_scan():
+    st.session_state.v2_scan = None
+    st.session_state.v2_results = None
 
 
 def reset_account_move_per_location():

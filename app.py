@@ -38,6 +38,7 @@ from app_ui import (
     init_account_move_session_state,
     init_account_revert_session_state,
     init_migrate_session_state,
+    init_move_to_v2_session_state,
     load_credentials,
     location_card,
     quest_migrate_current_step,
@@ -48,10 +49,16 @@ from app_ui import (
     reset_account_move_per_location,
     reset_account_move_rest,
     reset_from_location_change,
+    reset_move_to_v2_scan,
     show_account_move_results,
     show_results,
     step_heading,
     wizard_steps,
+)
+from move_to_v2 import (
+    TARGET_SYNC_MODE,
+    run_move_to_v2,
+    scan_account_for_v2,
 )
 
 
@@ -1132,6 +1139,186 @@ def account_revert_page():
                 st.error(str(error))
 
 
+def move_to_v2_page():
+    with st.container(border=True):
+        step_heading("Move to V2")
+        st.caption(
+            "Enter an account ID to scan locations for "
+            f"`posSettings.simphony_gen2.syncMode = {TARGET_SYNC_MODE}`. "
+            "Locations that are missing it (or have another value) can be updated — "
+            "we keep existing Simphony Gen2 settings and override `syncMode`."
+        )
+
+        account_id_input = st.text_input(
+            "Account ID",
+            value=st.session_state.v2_account_input,
+            placeholder="69774c7c157f655400e9011b",
+            key="v2_account_input_widget",
+        )
+        if account_id_input.strip() != st.session_state.v2_account_input:
+            st.session_state.v2_account_input = account_id_input.strip()
+            if st.session_state.v2_account_input != st.session_state.v2_account_id:
+                reset_move_to_v2_scan()
+
+        if st.button(
+            "Scan account locations",
+            type="primary",
+            disabled=not st.session_state.v2_account_input,
+            use_container_width=True,
+            key="v2_scan_btn",
+        ):
+            try:
+                with st.spinner("Loading locations…"):
+                    scan = scan_account_for_v2(st.session_state.v2_account_input)
+                st.session_state.v2_account_id = st.session_state.v2_account_input
+                st.session_state.v2_scan = scan
+                st.session_state.v2_results = None
+                track_event(
+                    "move_to_v2_scan",
+                    action="move_to_v2",
+                    account_id=st.session_state.v2_account_id,
+                    ready=len(scan["ready"]),
+                    needs_update=len(scan["needs_update"]),
+                )
+                st.rerun()
+            except Exception as error:
+                st.error(str(error))
+
+    scan = st.session_state.v2_scan
+    if not scan:
+        return
+
+    ready = scan["ready"]
+    needs_update = scan["needs_update"]
+    total = len(ready) + len(needs_update)
+
+    with st.container(border=True):
+        step_heading("Scan results")
+        st.caption(f"Account `{scan['account_id']}` · **{total}** location(s)")
+
+        if total == 0:
+            st.warning("No locations found on this account.")
+            return
+
+        if not needs_update:
+            st.success(
+                f"All **{len(ready)}** location(s) already have "
+                f"`syncMode = {TARGET_SYNC_MODE}`."
+            )
+        else:
+            st.warning(
+                f"**{len(needs_update)}** location(s) need V2 · "
+                f"**{len(ready)}** already on `syncMode = {TARGET_SYNC_MODE}`."
+            )
+
+        if needs_update:
+            st.markdown("**Needs update**")
+            st.dataframe(
+                [
+                    {
+                        "Location": row["name"],
+                        "Location ID": row["id"],
+                        "Current syncMode": (
+                            row["sync_mode"] if row["sync_mode"] is not None else "—"
+                        ),
+                    }
+                    for row in needs_update
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        if ready:
+            with st.expander(f"Already on V2 ({len(ready)})"):
+                for row in ready:
+                    st.write(f"- {row['name']} (`{row['id']}`)")
+
+    if needs_update:
+        with st.container(border=True):
+            step_heading("Update to V2")
+            st.caption(
+                f"Sets `posSettings.simphony_gen2.syncMode = {TARGET_SYNC_MODE}` on each "
+                "location above. Other Gen2 settings are kept; `syncMode` is overridden."
+            )
+            if st.button(
+                f"Update {len(needs_update)} location(s) to V2",
+                type="primary",
+                use_container_width=True,
+                key="v2_update_btn",
+            ):
+                progress = st.progress(0.0, text="Starting V2 update…")
+                status = st.empty()
+
+                def on_progress(fraction: float, message: str):
+                    progress.progress(min(max(fraction, 0.0), 1.0), text=message)
+                    status.caption(message)
+
+                try:
+                    locations = [row["location"] for row in needs_update]
+                    results = run_move_to_v2(locations, on_progress=on_progress)
+                    st.session_state.v2_results = results
+                    track_event(
+                        "move_to_v2_run",
+                        action="move_to_v2",
+                        account_id=scan["account_id"],
+                        location_count=len(locations),
+                        success=all(result.get("ok") for result in results),
+                    )
+                    # Refresh scan after update so the tables reflect new state.
+                    with st.spinner("Refreshing scan…"):
+                        st.session_state.v2_scan = scan_account_for_v2(scan["account_id"])
+                    st.rerun()
+                except Exception as error:
+                    st.error(str(error))
+
+    results = st.session_state.v2_results
+    if results:
+        with st.container(border=True):
+            step_heading("Update results")
+            ok_count = sum(1 for result in results if result.get("ok"))
+            fail_count = len(results) - ok_count
+            if fail_count == 0:
+                st.success(f"Updated **{ok_count}** location(s) to V2.")
+            else:
+                st.error(f"**{ok_count}** updated · **{fail_count}** failed.")
+
+            st.dataframe(
+                [
+                    {
+                        "Status": "🟢" if result.get("ok") else "🔴",
+                        "Location": result.get("name") or "",
+                        "Location ID": result.get("id") or "",
+                        "Before": (
+                            result.get("sync_mode_before")
+                            if result.get("sync_mode_before") is not None
+                            else "—"
+                        ),
+                        "After": (
+                            result.get("sync_mode_after")
+                            if result.get("sync_mode_after") is not None
+                            else "—"
+                        ),
+                        "Detail": result.get("action") or "",
+                        "HTTP": result.get("status") if result.get("status") is not None else "",
+                    }
+                    for result in results
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            failures = [result for result in results if not result.get("ok")]
+            for failure in failures:
+                with st.expander(
+                    f"Error · {failure.get('name') or failure.get('id')}",
+                    expanded=False,
+                ):
+                    if failure.get("response") is not None:
+                        st.json(failure["response"])
+                    else:
+                        st.write(failure)
+
+
 apply_styles()
 render_password_gate()
 render_header()
@@ -1149,6 +1336,14 @@ elif active_page == "account_move":
     init_account_move_session_state()
     track_page("account_move")
     account_move_page()
+elif active_page == "account_revert":
+    init_account_revert_session_state()
+    track_page("account_revert")
+    account_revert_page()
+elif active_page == "move_to_v2":
+    init_move_to_v2_session_state()
+    track_page("move_to_v2")
+    move_to_v2_page()
 else:
     init_account_revert_session_state()
     track_page("account_revert")
