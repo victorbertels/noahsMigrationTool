@@ -18,6 +18,11 @@ from account_migration import (
     run_account_move_revert,
 )
 from analytics import track_event, track_page
+from copy_custom_fields import (
+    CustomFieldCopyError,
+    apply_custom_field_copies,
+    scan_items_for_custom_fields,
+)
 from api import get_location, list_all_locations, list_all_roles
 from migration import (
     AccountGuardrailError,
@@ -37,6 +42,7 @@ from app_ui import (
     format_box,
     init_account_move_session_state,
     init_account_revert_session_state,
+    init_custom_fields_session_state,
     init_migrate_session_state,
     init_move_to_v2_session_state,
     load_credentials,
@@ -48,6 +54,7 @@ from app_ui import (
     reset_account_move_from_accounts_change,
     reset_account_move_per_location,
     reset_account_move_rest,
+    reset_custom_fields_scan,
     reset_from_location_change,
     reset_move_to_v2_scan,
     show_account_move_results,
@@ -1139,6 +1146,244 @@ def account_revert_page():
                 st.error(str(error))
 
 
+def _custom_field_table(rows: list[dict]) -> list[dict]:
+    status_labels = {
+        "ready": "Ready",
+        "unchanged": "Already set",
+        "unmatched": "Unmatched",
+        "skipped": "Skipped",
+    }
+    return [
+        {
+            "Status": status_labels.get(row.get("status"), row.get("status")),
+            "PLU": row.get("plu") or "",
+            "Item": row.get("name") or "",
+            "Scope": row.get("scope") or "",
+            "Destination": row.get("destination_name") or "",
+            "Fields": row.get("fields_label") or "",
+            "Detail": row.get("detail") or "",
+        }
+        for row in rows
+    ]
+
+
+def custom_fields_page():
+    with st.container(border=True):
+        step_heading("Copy custom fields")
+        st.caption(
+            "Checks every item on the source account. When custom fields are set "
+            "(`customFields`, `metadata`, or `metaData`), copies those values onto the "
+            "matching item in the destination account. Items match on PLU, product type, "
+            "and location name. Account-level items match account-level items. "
+            "Blank values are skipped. Destination-only keys are kept."
+        )
+
+        source_col, dest_col = st.columns(2)
+        with source_col:
+            source_input = st.text_input(
+                "Source account ID",
+                value=st.session_state.cf_source_input,
+                placeholder="Original account",
+                key="cf_source_input_widget",
+            )
+        with dest_col:
+            dest_input = st.text_input(
+                "Destination account ID",
+                value=st.session_state.cf_dest_input,
+                placeholder="Destination account",
+                key="cf_dest_input_widget",
+            )
+
+        source_changed = source_input.strip() != st.session_state.cf_source_input
+        dest_changed = dest_input.strip() != st.session_state.cf_dest_input
+        if source_changed or dest_changed:
+            st.session_state.cf_source_input = source_input.strip()
+            st.session_state.cf_dest_input = dest_input.strip()
+            if (
+                st.session_state.cf_source_input != st.session_state.cf_source_account_id
+                or st.session_state.cf_dest_input != st.session_state.cf_dest_account_id
+            ):
+                reset_custom_fields_scan()
+
+        accounts_ready = bool(st.session_state.cf_source_input and st.session_state.cf_dest_input)
+        if (
+            accounts_ready
+            and st.session_state.cf_source_input == st.session_state.cf_dest_input
+        ):
+            st.error("Source and destination account IDs must be different.")
+            accounts_ready = False
+
+        if st.button(
+            "Scan items",
+            type="primary",
+            disabled=not accounts_ready,
+            use_container_width=True,
+            key="cf_scan_btn",
+        ):
+            progress = st.progress(0.0, text="Starting scan…")
+            status = st.empty()
+
+            def on_progress(fraction: float, message: str):
+                progress.progress(min(max(fraction, 0.0), 1.0), text=message)
+                status.caption(message)
+
+            try:
+                plan = scan_items_for_custom_fields(
+                    st.session_state.cf_source_input,
+                    st.session_state.cf_dest_input,
+                    on_progress=on_progress,
+                )
+                st.session_state.cf_source_account_id = st.session_state.cf_source_input
+                st.session_state.cf_dest_account_id = st.session_state.cf_dest_input
+                st.session_state.cf_plan = plan
+                st.session_state.cf_results = None
+                track_event(
+                    "custom_fields_scan",
+                    action="custom_fields",
+                    source_account_id=plan["source_account_id"],
+                    destination_account_id=plan["destination_account_id"],
+                    items_with_custom_fields=plan["items_with_custom_fields"],
+                    ready=plan["ready"],
+                    unmatched=plan["unmatched"],
+                )
+                st.rerun()
+            except CustomFieldCopyError as error:
+                st.error(str(error))
+            except Exception as error:
+                st.error(str(error))
+
+    plan = st.session_state.cf_plan
+    if not plan:
+        return
+
+    rows = plan["rows"]
+    ready_rows = [row for row in rows if row["status"] == "ready"]
+    other_rows = [row for row in rows if row["status"] != "ready"]
+
+    with st.container(border=True):
+        step_heading("Scan results")
+        st.caption(
+            f"Source `{plan['source_account_id']}` · "
+            f"**{plan['source_item_count']}** item(s) · "
+            f"Destination `{plan['destination_account_id']}` · "
+            f"**{plan['destination_item_count']}** item(s)"
+        )
+        if plan["items_with_custom_fields"] == 0:
+            st.success("No items have custom fields set.")
+        else:
+            st.info(
+                f"**{plan['items_with_custom_fields']}** item(s) have custom fields set · "
+                f"**{plan['ready']}** to copy · "
+                f"**{plan['unchanged']}** already match · "
+                f"**{plan['unmatched']}** unmatched · "
+                f"**{plan['skipped']}** skipped."
+            )
+
+        if ready_rows:
+            st.markdown("**Will copy**")
+            st.dataframe(_custom_field_table(ready_rows), use_container_width=True, hide_index=True)
+
+        if other_rows:
+            with st.expander(f"Already matching, unmatched, or skipped ({len(other_rows)})"):
+                st.dataframe(_custom_field_table(other_rows), use_container_width=True, hide_index=True)
+
+    if ready_rows:
+        with st.container(border=True):
+            step_heading("Copy to destination")
+            st.caption(
+                "Writes only the custom fields that are set. Other item fields are left as they are."
+            )
+            dry_col, live_col = st.columns(2)
+            with dry_col:
+                run_dry = st.button(
+                    "Dry run",
+                    use_container_width=True,
+                    key="cf_dry_run_btn",
+                )
+            with live_col:
+                run_live = st.button(
+                    f"Copy {len(ready_rows)} item(s)",
+                    type="primary",
+                    use_container_width=True,
+                    key="cf_copy_btn",
+                )
+
+            if run_dry or run_live:
+                dry_run = run_dry and not run_live
+                progress = st.progress(0.0, text="Starting…")
+                status = st.empty()
+
+                def on_progress(fraction: float, message: str):
+                    progress.progress(min(max(fraction, 0.0), 1.0), text=message)
+                    status.caption(message)
+
+                try:
+                    results = apply_custom_field_copies(
+                        ready_rows,
+                        plan["destination_account_id"],
+                        dry_run=dry_run,
+                        on_progress=on_progress,
+                    )
+                    st.session_state.cf_results = results
+                    track_event(
+                        "custom_fields_copy",
+                        action="custom_fields",
+                        dry_run=dry_run,
+                        item_count=len(ready_rows),
+                        source_account_id=plan["source_account_id"],
+                        destination_account_id=plan["destination_account_id"],
+                        success=all(result.get("ok") for result in results),
+                    )
+                    if not dry_run:
+                        with st.spinner("Refreshing scan…"):
+                            st.session_state.cf_plan = scan_items_for_custom_fields(
+                                plan["source_account_id"],
+                                plan["destination_account_id"],
+                            )
+                    st.rerun()
+                except CustomFieldCopyError as error:
+                    st.error(str(error))
+                except Exception as error:
+                    st.error(str(error))
+
+    results = st.session_state.cf_results
+    if results:
+        with st.container(border=True):
+            step_heading("Copy results")
+            ok_count = sum(1 for result in results if result.get("ok"))
+            fail_count = len(results) - ok_count
+            dry_run = any(result.get("dry_run") for result in results)
+            if fail_count == 0:
+                label = "Would copy" if dry_run else "Copied"
+                st.success(f"{label} custom fields on **{ok_count}** item(s).")
+            else:
+                st.error(f"**{ok_count}** succeeded · **{fail_count}** failed.")
+
+            st.dataframe(
+                [
+                    {
+                        "Status": "🟢" if result.get("ok") else "🔴",
+                        "PLU": result.get("plu") or "",
+                        "Item": result.get("name") or "",
+                        "Scope": result.get("scope") or "",
+                        "Fields": result.get("fields_label") or "",
+                        "Detail": result.get("action") or "",
+                        "HTTP": result.get("status") if result.get("status") is not None else "",
+                    }
+                    for result in results
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
+            failures = [result for result in results if not result.get("ok")]
+            for failure in failures:
+                with st.expander(f"Error · {failure.get('name') or failure.get('plu')}", expanded=False):
+                    if failure.get("response") is not None:
+                        st.json(failure["response"])
+                    else:
+                        st.write(failure.get("action"))
+
+
 def move_to_v2_page():
     with st.container(border=True):
         step_heading("Move to V2")
@@ -1340,6 +1585,10 @@ elif active_page == "account_revert":
     init_account_revert_session_state()
     track_page("account_revert")
     account_revert_page()
+elif active_page == "custom_fields":
+    init_custom_fields_session_state()
+    track_page("custom_fields")
+    custom_fields_page()
 elif active_page == "move_to_v2":
     init_move_to_v2_session_state()
     track_page("move_to_v2")
