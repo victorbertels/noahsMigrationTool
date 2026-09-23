@@ -264,7 +264,7 @@ def render_header():
         """
         <div class="app-header">
             <h1>Noah's Migration Tools</h1>
-            <p>Quest settings migration and account channel-link moves, with backup &amp; restore</p>
+            <p>Quest settings, account moves, and item custom-field copies, with backup &amp; restore</p>
         </div>
         """,
         unsafe_allow_html=True,
@@ -276,6 +276,7 @@ PAGE_LABELS = {
     "revert": "Quest revert",
     "account_move": "Account move",
     "account_revert": "Account revert",
+    "custom_fields": "Custom fields",
     "move_to_v2": "Move to V2",
 }
 
@@ -293,6 +294,7 @@ def render_nav() -> str:
         "revert",
         "account_move",
         "account_revert",
+        "custom_fields",
         "move_to_v2",
     ]
     # Lay out nav buttons in rows of 2.
@@ -1050,6 +1052,25 @@ def init_account_revert_session_state():
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
+
+
+def init_custom_fields_session_state():
+    defaults = {
+        "cf_source_input": "",
+        "cf_dest_input": "",
+        "cf_source_account_id": "",
+        "cf_dest_account_id": "",
+        "cf_plan": None,
+        "cf_results": None,
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+def reset_custom_fields_scan():
+    st.session_state.cf_plan = None
+    st.session_state.cf_results = None
 
 
 def init_move_to_v2_session_state():

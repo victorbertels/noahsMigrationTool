@@ -8,7 +8,7 @@ import requests
 from auth import getHeaders
 
 # Module version marker for deploy debugging (must include get_user).
-API_MODULE_VERSION = "2026-08-12-busy-logout-prep"
+API_MODULE_VERSION = "2026-09-23-product-custom-fields"
 
 BASE_URL = "https://api.deliverect.io"
 PICKER_BASE_URL = "https://picker-backend.deliverect.com"
@@ -317,6 +317,82 @@ def set_busy_mode(
         "preparationTimeDelay": preparation_time_delay,
     }
     response = _request("POST", f"location/{location_id}/busymode", payload=payload)
+    try:
+        data = response.json()
+    except ValueError:
+        data = {"raw": response.text}
+    return data, response.status_code
+
+
+PRODUCT_LIST_PROJECTION = {
+    "plu": 1,
+    "name": 1,
+    "account": 1,
+    "location": 1,
+    "productType": 1,
+    "customFields": 1,
+    "metadata": 1,
+    "metaData": 1,
+    "_etag": 1,
+    "_deleted": 1,
+}
+
+
+def list_all_products(account_id: str) -> List[Dict]:
+    """Fetch all products (items) for an account using cursor pagination.
+
+    Projects the fields needed to detect and copy custom fields so large
+    catalogs are not pulled in full.
+    """
+    products: List[Dict] = []
+    page = 1
+    cursor = "new"
+
+    while True:
+        params = {
+            "where": json.dumps({"account": account_id}),
+            "projection": json.dumps(PRODUCT_LIST_PROJECTION),
+            "max_results": 500,
+            "cursor": cursor,
+            "page": page,
+        }
+        response = _request("GET", "products", params=params)
+        if response.status_code != 200:
+            detail = (response.text or "")[:500]
+            raise RuntimeError(
+                f"Failed to list products for account {account_id}: "
+                f"HTTP {response.status_code} {detail}"
+            )
+
+        data = response.json()
+        items = data.get("_items", data if isinstance(data, list) else [])
+        products.extend(items)
+
+        meta = data.get("_meta", {}) if isinstance(data, dict) else {}
+        total = meta.get("total")
+        if total is not None and len(products) >= total:
+            break
+        if len(items) < 500:
+            break
+
+        if page == 1 and meta.get("cursor"):
+            cursor = meta["cursor"]
+        page += 1
+
+    return products
+
+
+def get_product(product_id: str) -> Tuple[Dict, int]:
+    response = _request("GET", f"products/{product_id}")
+    try:
+        data = response.json()
+    except ValueError:
+        data = {"raw": response.text}
+    return data, response.status_code
+
+
+def patch_product(product_id: str, payload: Dict, etag: Optional[str]) -> Tuple[Dict, int]:
+    response = _request("PATCH", f"products/{product_id}", payload=payload, etag=etag)
     try:
         data = response.json()
     except ValueError:
